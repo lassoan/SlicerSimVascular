@@ -714,7 +714,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         coefficientArray = numpy_to_vtk(np.ascontiguousarray(displacements, dtype=np.float64), deep=True)
         coefficientArray.SetName("Displacement")
         coefficientImage.GetPointData().SetScalars(coefficientArray)
-        bsplineTransform = vtk.vtkBSplineTransform()
+        # vtkOrientedBSplineTransform (not plain vtkBSplineTransform) is required for the transform
+        # node to be convertible to an ITK transform when saving to file
+        bsplineTransform = slicer.vtkOrientedBSplineTransform()
         bsplineTransform.SetCoefficientData(coefficientImage)
         bsplineTransform.SetBorderModeToEdge()
 
@@ -1367,9 +1369,10 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         self.assertGreater(outputRadiusAtCenter, inputRadiusAtCenter + 1.0)
         self.assertAlmostEqual(outputRadiusAtCenter, targetRadius, delta=1.0)
 
-        # Surface far away from the stented region must remain unchanged
+        # Surface far away from the stented region (beyond the stent, its end caps, and the
+        # deformation influence region) must remain unchanged
         surfaceDisplacements = np.linalg.norm(outputSurfacePoints - inputSurfacePoints, axis=1)
-        farFromStentMask = np.linalg.norm(inputSurfacePoints - centerPosition, axis=1) > 30.0
+        farFromStentMask = np.linalg.norm(inputSurfacePoints - centerPosition, axis=1) > 0.5 * parameterNode.stentLength + 20.0
         self.assertLess(np.max(surfaceDisplacements[farFromStentMask]), 0.1)
 
         # Displacement point data arrays must point from the deployed positions back to the original positions
@@ -1422,5 +1425,10 @@ class SDFStentTest(ScriptedLoadableModuleTest):
 
         # Show the realistic stent mesh instead of the straight stent template
         parameterNode.outputStraightStentModel.GetDisplayNode().SetVisibility(False)
+
+        # The stent transform must be savable to file (requires ITK-convertible transform components)
+        transformFilePath = os.path.join(slicer.app.temporaryPath, "SDFStentTest_StentTransform.h5")
+        self.assertTrue(slicer.util.saveNode(parameterNode.outputStentTransform, transformFilePath))
+        os.remove(transformFilePath)
 
         self.delayDisplay("SDFStent Vessel01 deployment test passed")
