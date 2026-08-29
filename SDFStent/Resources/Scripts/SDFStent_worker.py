@@ -41,6 +41,19 @@ def _write_vtp(poly_data, path):
     writer.Write()
 
 
+def _add_displacement_array(poly_data, current_pts_cm, initial_pts_cm):
+    """Add a "Displacement" point data array (in mm) that points from each deployed point position
+    back to its initial (undeployed) position."""
+    import numpy as np
+    from vtk.util.numpy_support import numpy_to_vtk
+    displacements_mm = np.ascontiguousarray(
+        (np.asarray(initial_pts_cm) - np.asarray(current_pts_cm)) * CM_TO_MM, dtype=np.float32)
+    displacement_array = numpy_to_vtk(displacements_mm, deep=True)
+    displacement_array.SetName("Displacement")
+    poly_data.GetPointData().AddArray(displacement_array)
+    poly_data.GetPointData().SetActiveVectors("Displacement")
+
+
 def _scaled_polydata(poly_data, scale):
     import vtk
     transform = vtk.vtkTransform()
@@ -102,6 +115,9 @@ def main(workdir):
             surface_pd=surface_pd_cm,
             centerline_pd=centerline_pd_cm,
         )
+
+        initial_surface_pts = ctx.data["points"]["surface"].copy()
+        initial_centerline_pts = ctx.data["points"]["centerline"].copy()
 
         deformation.set_node_indices(ctx.data, [start_point_id])
         deformation.set_force_center(ctx.data, start_point_id)
@@ -165,6 +181,8 @@ def main(workdir):
 
         output_surface_mm = _scaled_polydata(ctx.surface_pd, CM_TO_MM)
         output_centerline_mm = _scaled_polydata(ctx.centerline_pd, CM_TO_MM)
+        _add_displacement_array(output_surface_mm, ctx.data["points"]["surface"], initial_surface_pts)
+        _add_displacement_array(output_centerline_mm, ctx.data["points"]["centerline"], initial_centerline_pts)
 
         _write_vtp(output_surface_mm, workdir / "surface_output.vtp")
         _write_vtp(output_centerline_mm, workdir / "centerline_output.vtp")

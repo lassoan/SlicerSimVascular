@@ -531,6 +531,21 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             raise ValueError("Input centerline has no polydata")
         return centerlinePolyData
 
+    def _outputPolyDataWithDisplacements(self, polyDataCm: vtk.vtkPolyData, currentPointsCm, initialPointsCm) -> vtk.vtkPolyData:
+        """Return polydata scaled to mm, with a "Displacement" point data array (in mm) that points
+        from each deployed point position back to its initial (undeployed) position."""
+        import numpy as np
+        from vtk.util.numpy_support import numpy_to_vtk
+
+        outputPolyData = self._scaledPolyData(polyDataCm, self._cmToMm)
+        displacementsMm = np.ascontiguousarray(
+            (np.asarray(initialPointsCm) - np.asarray(currentPointsCm)) * self._cmToMm, dtype=np.float32)
+        displacementArray = numpy_to_vtk(displacementsMm, deep=True)
+        displacementArray.SetName("Displacement")
+        outputPolyData.GetPointData().AddArray(displacementArray)
+        outputPolyData.GetPointData().SetActiveVectors("Displacement")
+        return outputPolyData
+
     def _setDisplayedPolyData(self, node: vtkMRMLModelNode, polyData: vtk.vtkPolyData, defaultOpacity: float | None = None, defaultColor: tuple[float, float, float] | None = None) -> None:
         node.SetAndObservePolyData(polyData)
         displayNode = node.GetDisplayNode()
@@ -709,8 +724,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 ctx.data["points"]["centerline"][:] = clPts
                 vtk_io.sync_polydata(ctx.surface_pd, ctx.data, "surface")
                 vtk_io.sync_polydata(ctx.centerline_pd, ctx.data, "centerline")
-                outputSurfacePolyData = self._scaledPolyData(ctx.surface_pd, self._cmToMm)
-                outputCenterlinePolyData = self._scaledPolyData(ctx.centerline_pd, self._cmToMm)
+                outputSurfacePolyData = self._outputPolyDataWithDisplacements(ctx.surface_pd, surfPts, ptCache[0][1])
+                outputCenterlinePolyData = self._outputPolyDataWithDisplacements(ctx.centerline_pd, clPts, ptCache[0][2])
                 self._setDisplayedPolyData(outputSurfaceNode, outputSurfacePolyData, defaultOpacity=0.5, defaultColor=(1.0, 0.5, 0.0))
                 self._setDisplayedPolyData(outputCenterlineNode, outputCenterlinePolyData)
                 parameterNode.actualRadius = bestR * self._cmToMm
@@ -769,9 +784,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             }
             self._deploymentState = state
 
-            # Show the initial (undeployed) surface immediately
-            outputSurfacePolyData = self._scaledPolyData(ctx.surface_pd, self._cmToMm)
-            outputCenterlinePolyData = self._scaledPolyData(ctx.centerline_pd, self._cmToMm)
+            # Show the initial (undeployed) surface immediately (with zero displacements)
+            outputSurfacePolyData = self._outputPolyDataWithDisplacements(ctx.surface_pd, ptCache[0][1], ptCache[0][1])
+            outputCenterlinePolyData = self._outputPolyDataWithDisplacements(ctx.centerline_pd, ptCache[0][2], ptCache[0][2])
             self._setDisplayedPolyData(outputSurfaceNode, outputSurfacePolyData, defaultOpacity=0.5, defaultColor=(1.0, 0.5, 0.0))
             self._setDisplayedPolyData(outputCenterlineNode, outputCenterlinePolyData)
             ptCache = state["ptCache"]
@@ -846,8 +861,10 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 # Real-time update of output models
                 vtk_io.sync_polydata(ctx.surface_pd, ctx.data, "surface")
                 vtk_io.sync_polydata(ctx.centerline_pd, ctx.data, "centerline")
-                outputSurfaceNode.SetAndObservePolyData(self._scaledPolyData(ctx.surface_pd, self._cmToMm))
-                outputCenterlineNode.SetAndObservePolyData(self._scaledPolyData(ctx.centerline_pd, self._cmToMm))
+                outputSurfaceNode.SetAndObservePolyData(
+                    self._outputPolyDataWithDisplacements(ctx.surface_pd, ctx.data["points"]["surface"], ptCache[0][1]))
+                outputCenterlineNode.SetAndObservePolyData(
+                    self._outputPolyDataWithDisplacements(ctx.centerline_pd, ctx.data["points"]["centerline"], ptCache[0][2]))
                 slicer.app.processEvents()
 
             elapsed = time.time() - t0
@@ -856,8 +873,10 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             # Final update (covers the case where the loop exited on the first check)
             vtk_io.sync_polydata(ctx.surface_pd, ctx.data, "surface")
             vtk_io.sync_polydata(ctx.centerline_pd, ctx.data, "centerline")
-            outputSurfaceNode.SetAndObservePolyData(self._scaledPolyData(ctx.surface_pd, self._cmToMm))
-            outputCenterlineNode.SetAndObservePolyData(self._scaledPolyData(ctx.centerline_pd, self._cmToMm))
+            outputSurfaceNode.SetAndObservePolyData(
+                self._outputPolyDataWithDisplacements(ctx.surface_pd, ctx.data["points"]["surface"], ptCache[0][1]))
+            outputCenterlineNode.SetAndObservePolyData(
+                self._outputPolyDataWithDisplacements(ctx.centerline_pd, ctx.data["points"]["centerline"], ptCache[0][2]))
 
             parameterNode.actualRadius = ptCache[-1][0] * self._cmToMm
             elapsedMs = startTime.msecsTo(qt.QDateTime.currentDateTimeUtc())
@@ -1131,5 +1150,16 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         surfaceDisplacements = np.linalg.norm(outputSurfacePoints - inputSurfacePoints, axis=1)
         farFromStentMask = np.linalg.norm(inputSurfacePoints - centerPosition, axis=1) > 30.0
         self.assertLess(np.max(surfaceDisplacements[farFromStentMask]), 0.1)
+
+        # Displacement point data arrays must point from the deployed positions back to the original positions
+        surfaceDisplacementArray = outputSurfacePolyData.GetPointData().GetArray("Displacement")
+        self.assertIsNotNone(surfaceDisplacementArray)
+        self.assertEqual(surfaceDisplacementArray.GetNumberOfComponents(), 3)
+        self.assertEqual(surfaceDisplacementArray.GetNumberOfTuples(), outputSurfacePolyData.GetNumberOfPoints())
+        np.testing.assert_allclose(vtk_to_numpy(surfaceDisplacementArray), inputSurfacePoints - outputSurfacePoints, atol=0.01)
+        centerlineDisplacementArray = outputCenterlinePolyData.GetPointData().GetArray("Displacement")
+        self.assertIsNotNone(centerlineDisplacementArray)
+        self.assertEqual(centerlineDisplacementArray.GetNumberOfComponents(), 3)
+        self.assertEqual(centerlineDisplacementArray.GetNumberOfTuples(), outputCenterlinePolyData.GetNumberOfPoints())
 
         self.delayDisplay("SDFStent Vessel01 deployment test passed")
