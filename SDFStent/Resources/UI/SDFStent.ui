@@ -348,13 +348,33 @@
        </widget>
       </item>
       <item row="5" column="0">
+       <widget class="QLabel" name="labelComputeStrain">
+        <property name="text">
+         <string>Compute strain:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
+       <widget class="QCheckBox" name="computeStrainCheckBox">
+        <property name="toolTip">
+         <string>Add principal strain and area strain cell data arrays to the output surface model. Unlike displacement, strain is not affected by translation or rotation of the vessel wall, so it characterizes how much the vessel wall expands.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>computeStrain</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="0">
        <widget class="QLabel" name="labelOutputStentTransform">
         <property name="text">
          <string>Output stent transform:</string>
         </property>
        </widget>
       </item>
-      <item row="5" column="1">
+      <item row="6" column="1">
        <widget class="qMRMLNodeComboBox" name="outputStentTransformSelector">
         <property name="nodeTypes">
          <stringlist notr="true">
@@ -378,14 +398,14 @@
         </property>
        </widget>
       </item>
-      <item row="6" column="0">
+      <item row="7" column="0">
        <widget class="QLabel" name="labelOutputStraightStent">
         <property name="text">
          <string>Output straight stent model:</string>
         </property>
        </widget>
       </item>
-      <item row="6" column="1">
+      <item row="7" column="1">
        <widget class="qMRMLNodeComboBox" name="outputStraightStentSelector">
         <property name="nodeTypes">
          <stringlist notr="true">
