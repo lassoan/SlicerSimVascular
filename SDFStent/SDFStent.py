@@ -841,7 +841,17 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         radialExtent = 2.0 * max(startRadiusMm, 1.0)
         axialMargin = maxCapsuleRadiusMm + 0.2 * stentLengthMm
         axialExtent = 0.5 * stentLengthMm + axialMargin
-        axialSpacing = stentLengthMm / 25.0
+        # The radial expansion falls off over the flattened end cap height, which can be much
+        # shorter than the default grid spacing when the cap height fraction is low. B-spline
+        # coefficients are set by direct sampling and the spline does not interpolate steep
+        # coefficient changes exactly, so a falloff that the grid cannot resolve makes the
+        # spline sag below full expansion just inside the stent tip. Refine the axial spacing
+        # to resolve the cap height (with a floor to bound the grid size), and extend the
+        # full-expansion plateau by a guard band beyond the stent ends so the spline smoothing
+        # cannot pull the expansion below the deployed radius within the stent.
+        minCapHeightMm = capHeightFraction * capsuleRadiusMm * (float(np.min(radiusProfile[1])) if radiusProfile is not None else 1.0)
+        axialSpacing = min(stentLengthMm / 25.0, max(minCapHeightMm / 2.0, stentLengthMm / 200.0, 0.2))
+        transitionGuardMm = 2.0 * axialSpacing
         axialNodeCount = int(np.ceil(2.0 * axialExtent / axialSpacing)) + 1
         gridX = np.linspace(-radialExtent, radialExtent, 13)
         gridY = np.linspace(-radialExtent, radialExtent, 13)
@@ -871,8 +881,10 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 normalizedArcPosition = min(max(stentArcPosition / stentAxisLength, 0.0), 1.0)
                 localCapsuleRadiusMm = capsuleRadiusMm * float(np.interp(normalizedArcPosition, radiusProfile[0], radiusProfile[1]))
             # The end caps are flattened half ellipsoids (matching the deployment SDF), so
-            # measure the overhang in units of the reduced axial semi-axis
+            # measure the overhang in units of the reduced axial semi-axis. The transition
+            # guard keeps the expansion at its full value slightly beyond the stent ends.
             overhang = max(0.0, -stentArcPosition, stentArcPosition - stentAxisLength)
+            overhang = max(0.0, overhang - transitionGuardMm)
             capHeightMm = capHeightFraction * localCapsuleRadiusMm
             capsuleProfileRadius = localCapsuleRadiusMm * (max(1.0 - (overhang / capHeightMm) ** 2, 0.0)) ** 0.5
             blend = min(max((capsuleProfileRadius - (startRadiusMm - transitionWidth)) / (2.0 * transitionWidth), 0.0), 1.0)
@@ -1658,9 +1670,51 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         self.setUp()
         self.test_SDFStent_taperedSdfConcaveProfile()
         self.setUp()
+        self.test_SDFStent_stentTransformFlattenedCaps()
+        self.setUp()
         self.test_SDFStent_deployVessel01()
         self.setUp()
         self.test_SDFStent_deployVessel01Flared()
+
+    def test_SDFStent_stentTransformFlattenedCaps(self):
+        """The stent transform must expand the straight stent fully to the deployed radius all
+        the way to the stent ends, even when a low end cap height fraction makes the radial
+        falloff at the ends much shorter than the default B-spline grid spacing (the grid is
+        refined and the falloff delayed by a guard band so the spline cannot sag below full
+        expansion within the stent)."""
+        import numpy as np
+
+        logic = SDFStentLogic()
+        centerlineNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsCurveNode", "TestCenterline")
+        centerlineNode.SetCurveTypeToLinear()
+        for z in np.linspace(-60.0, 60.0, 25):
+            centerlineNode.AddControlPointWorld(0.0, 0.0, float(z))
+
+        stentLengthMm = 45.0
+        startRadiusMm = 3.0
+        deployedRadiusMm = 9.0
+        axisHalfLengthMm = 20.0  # deployed (foreshortened) stent axis half length
+        transformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode", "TestStentTransform")
+        logic._updateStentTransformNode(transformNode, centerlineNode,
+                                        [0.0, 0.0, -axisHalfLengthMm], [0.0, 0.0, axisHalfLengthMm],
+                                        deployedRadiusMm, startRadiusMm, stentLengthMm,
+                                        radiusProfile=None, capHeightFraction=0.1)
+        stentTransform = transformNode.GetTransformToParent()
+
+        def warpedRadius(zModel):
+            # The centerline is a straight line along z through the origin, so the deployed
+            # radius of a warped stent surface point is its distance from the z axis
+            transformed = np.array(stentTransform.TransformPoint([startRadiusMm, 0.0, zModel]))
+            return np.linalg.norm(transformed[:2])
+
+        # Full expansion everywhere within the stent, including at the very ends
+        for zModel in (-0.5 * stentLengthMm, -0.45 * stentLengthMm, 0.0, 0.45 * stentLengthMm, 0.5 * stentLengthMm):
+            self.assertAlmostEqual(warpedRadius(zModel), deployedRadiusMm, delta=0.5)
+        # No radial expansion well beyond the stent ends
+        for zModel in (-0.5 * stentLengthMm - 12.0, 0.5 * stentLengthMm + 12.0):
+            self.assertAlmostEqual(warpedRadius(zModel), startRadiusMm, delta=0.5)
+
+        self.delayDisplay("SDFStent transform flattened caps test passed")
 
     def test_SDFStent_taperedSdfConcaveProfile(self):
         """The tapered capsule-chain SDF must preserve a concave (dumbbell) radius profile.
