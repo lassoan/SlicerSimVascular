@@ -17,6 +17,7 @@ from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
+    Choice,
     WithinRange,
 )
 
@@ -99,6 +100,15 @@ class SDFStentParameterNode:
     targetRadius: Annotated[float, WithinRange(0.0001, 30.0)] = 10.0
     startRadius: Annotated[float, WithinRange(0.0001, 30.0)] = 5.0
     stentLength: Annotated[float, WithinRange(0.0001, 100.0)] = 30.0
+    # Optional flared (funnel/trumpet) end: the stent radius transitions from targetRadius to
+    # flareRadius over flareLength at the selected end of the stent (relative to the direction
+    # of the input centerline).
+    flaredEnd: Annotated[str, Choice(["None", "Centerline start", "Centerline end"])] = "None"
+    flareRadius: Annotated[float, WithinRange(0.0001, 60.0)] = 15.0
+    flareLength: Annotated[float, WithinRange(0.0001, 100.0)] = 10.0
+    # Axial semi-axis of the flattened half-ellipsoid capsule end caps, as a fraction of the
+    # local stent radius (1.0 = spherical caps, svMorph's original pill shape)
+    flattenedCapHeightFraction: Annotated[float, WithinRange(0.05, 1.0)] = 0.35
     enableSnapshots: bool = False
     verboseLogging: bool = False
     computeOutputModelArrays: bool = False
@@ -321,6 +331,12 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.updateButton.toolTip = _("Parameter node is not available.")
             return
 
+        flareEnabled = self._parameterNode.flaredEnd != "None"
+        self.ui.flareRadiusSpinBox.enabled = flareEnabled
+        self.ui.flareLengthSpinBox.enabled = flareEnabled
+        self.ui.labelFlareRadius.enabled = flareEnabled
+        self.ui.labelFlareLength.enabled = flareEnabled
+
         inputVesselSegmentation = self.ui.inputSurfaceSelector.currentNode()
         inputVesselSegmentId = self.ui.inputSurfaceSelector.currentSegmentID()
         inputCenterlineCurve = self.ui.inputCenterlineSelector.currentNode()
@@ -353,6 +369,14 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         canApply = disabledReason is None
         self.ui.updateButton.enabled = canApply
         self.ui.updateButton.toolTip = disabledReason if disabledReason else _("Run stent deployment and load output models.")
+
+    def _currentFlareParameters(self) -> tuple | None:
+        if not self._parameterNode:
+            return None
+        return (self._parameterNode.flaredEnd,
+                float(self._parameterNode.flareRadius),
+                float(self._parameterNode.flareLength),
+                float(self._parameterNode.flattenedCapHeightFraction))
 
     def _setStatus(self, text: str) -> None:
         self.ui.statusLabel.text = text
@@ -416,6 +440,7 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             targetRadiusAtStart = float(self.ui.targetRadiusSpinBox.value)
             startRadiusAtStart = float(self.ui.startRadiusSpinBox.value)
             stentLengthAtStart = float(self.ui.stentLengthSpinBox.value)
+            flareParametersAtStart = self._currentFlareParameters()
             cancelledByUser = False
             try:
                 self._ensureSvmorphInstalled()
@@ -460,6 +485,7 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                         float(self.ui.targetRadiusSpinBox.value) != targetRadiusAtStart
                         or float(self.ui.startRadiusSpinBox.value) != startRadiusAtStart
                         or float(self.ui.stentLengthSpinBox.value) != stentLengthAtStart
+                        or self._currentFlareParameters() != flareParametersAtStart
                         or currentCenterPointPosition != centerPointPositionAtStart
                     )
                     if inputsChanged:
@@ -492,6 +518,41 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
     def getParameterNode(self):
         return SDFStentParameterNode(super().getParameterNode())
+
+    def _taperModule(self):
+        """Import the shared tapered-stent module (also used by the standalone worker script)."""
+        import sys
+        scriptsDir = os.path.join(os.path.dirname(__file__), "Resources", "Scripts")
+        if scriptsDir not in sys.path:
+            sys.path.insert(0, scriptsDir)
+        import SDFStent_taper
+        return SDFStent_taper
+
+    def _flareParametersFromNode(self, parameterNode: SDFStentParameterNode) -> dict | None:
+        """Flare parameters (in mm) from the parameter node, or None when no end is flared."""
+        flaredEnd = parameterNode.flaredEnd
+        if flaredEnd not in ("Centerline start", "Centerline end"):
+            return None
+        return {
+            "flaredEnd": flaredEnd,
+            "flareRadius": float(parameterNode.flareRadius),
+            "flareLength": float(parameterNode.flareLength),
+        }
+
+    def _radiusProfileFractions(self, axisPointsCm, flareParameters: dict | None, targetRadiusMm: float):
+        """Per-axis-vertex stent radius profile as dimensionless fractions of the nominal target
+        radius, or None for a uniform-radius (pill shaped) stent. The stent axis is resampled
+        walking backward along the centerline (toward its first point), so the first axis vertex
+        is on the centerline end side and the last axis vertex on the centerline start side."""
+        if not flareParameters:
+            return None
+        flareAtAxisStart = flareParameters["flaredEnd"] == "Centerline end"
+        return self._taperModule().flare_profile_fractions(
+            axisPointsCm,
+            float(targetRadiusMm) * self._mmToCm,
+            flareParameters["flareRadius"] * self._mmToCm,
+            flareParameters["flareLength"] * self._mmToCm,
+            flareAtAxisStart)
 
     def _scaledPolyData(self, polyData: vtk.vtkPolyData, scaleFactor: float) -> vtk.vtkPolyData:
         transform = vtk.vtkTransform()
@@ -717,7 +778,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         return curveNode
 
     def _updateStentTransformNode(self, transformNode: vtkMRMLTransformNode, centerlineCurveNode: vtkMRMLMarkupsCurveNode,
-                                  stentAxisStartMm, stentAxisEndMm, capsuleRadiusMm: float, startRadiusMm: float, stentLengthMm: float) -> None:
+                                  stentAxisStartMm, stentAxisEndMm, capsuleRadiusMm: float, startRadiusMm: float, stentLengthMm: float,
+                                  radiusProfile: tuple | None = None, capHeightFraction: float = 0.35) -> None:
         """Set transformNode to a rigid+bspline combination that moves and warps the straight stent model
         (cylinder of start radius/stent length, centered at the origin, long axis along Z) to the deployed
         stent. The rigid transform maps the model center to the stent center with the model Z axis along
@@ -725,8 +787,13 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         coordinate system) bends the tube along the centerline and expands it to the deployed radius
         (with axial foreshortening). Beyond the stent length the warp follows the centerline continuation
         without radial expansion or foreshortening, with a smooth transition near the stent ends that
-        follows the spherical end cap profile of the deployed stent. Positions and parallel transport
-        frames along the centerline are provided by the curve node."""
+        follows the flattened half-ellipsoid end cap profile of the deployed stent (matching
+        SDFStent_taper.install_tapered_sdf). Positions and parallel transport frames along the
+        centerline are provided by the curve node.
+        radiusProfile optionally describes a variable stent radius (e.g. a flared end) as a tuple of
+        (normalized arc positions from the stent axis start, radius fractions of capsuleRadiusMm).
+        capHeightFraction is the axial semi-axis of the flattened half-ellipsoid end caps as a
+        fraction of the local radius, matching the value used by the deployment SDF."""
         import numpy as np
         from vtk.util.numpy_support import numpy_to_vtk
 
@@ -769,8 +836,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
         # BSpline transform, defined in the model coordinate system: displacement at model point p is
         # chosen so that rigid(bspline(p)) lands on the corresponding point along the deployed stent
+        maxCapsuleRadiusMm = capsuleRadiusMm * (float(np.max(radiusProfile[1])) if radiusProfile is not None else 1.0)
         radialExtent = 2.0 * max(startRadiusMm, 1.0)
-        axialMargin = capsuleRadiusMm + 0.2 * stentLengthMm
+        axialMargin = maxCapsuleRadiusMm + 0.2 * stentLengthMm
         axialExtent = 0.5 * stentLengthMm + axialMargin
         axialSpacing = stentLengthMm / 25.0
         axialNodeCount = int(np.ceil(2.0 * axialExtent / axialSpacing)) + 1
@@ -780,9 +848,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
         # The frame and radial scale only depend on z, so compute them once per grid plane.
         # Axial mapping: foreshortened inside the stent, arc-length preserving beyond the stent ends.
-        # Radial scale: deployed radius inside the stent, following the spherical end cap profile near
-        # the stent ends, and no expansion (scale 1) beyond that; blended with a smoothstep so the
-        # transition is smooth while staying exact inside and far outside the stent.
+        # Radial scale: deployed radius inside the stent, following the flattened half-ellipsoid end
+        # cap profile near the stent ends, and no expansion (scale 1) beyond that; blended with a
+        # smoothstep so the transition is smooth while staying exact inside and far outside the stent.
         halfLength = 0.5 * stentLengthMm
         transitionWidth = 0.5 * startRadiusMm
         positions = np.zeros((axialNodeCount, 3))
@@ -797,8 +865,15 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             else:
                 stentArcPosition = (z + halfLength) / stentLengthMm * stentAxisLength
             positions[zIndex], normals[zIndex], binormals[zIndex], _ = frameAt(stentArcPosition)
+            localCapsuleRadiusMm = capsuleRadiusMm
+            if radiusProfile is not None and stentAxisLength > 0.0:
+                normalizedArcPosition = min(max(stentArcPosition / stentAxisLength, 0.0), 1.0)
+                localCapsuleRadiusMm = capsuleRadiusMm * float(np.interp(normalizedArcPosition, radiusProfile[0], radiusProfile[1]))
+            # The end caps are flattened half ellipsoids (matching the deployment SDF), so
+            # measure the overhang in units of the reduced axial semi-axis
             overhang = max(0.0, -stentArcPosition, stentArcPosition - stentAxisLength)
-            capsuleProfileRadius = (max(capsuleRadiusMm ** 2 - overhang ** 2, 0.0)) ** 0.5
+            capHeightMm = capHeightFraction * localCapsuleRadiusMm
+            capsuleProfileRadius = localCapsuleRadiusMm * (max(1.0 - (overhang / capHeightMm) ** 2, 0.0)) ** 0.5
             blend = min(max((capsuleProfileRadius - (startRadiusMm - transitionWidth)) / (2.0 * transitionWidth), 0.0), 1.0)
             blend = blend * blend * (3.0 - 2.0 * blend)  # smoothstep
             radialScales[zIndex] = (startRadiusMm + blend * max(capsuleProfileRadius - startRadiusMm, 0.0)) / startRadiusMm
@@ -839,9 +914,15 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             return
         import numpy as np
         axisPointsMm = np.asarray(axisPointsCm, dtype=float) * self._cmToMm
+        radiusProfile = None
+        flareParameters = self._flareParametersFromNode(parameterNode)
+        if flareParameters:
+            fractions = self._radiusProfileFractions(axisPointsCm, flareParameters, parameterNode.targetRadius)
+            radiusProfile = (self._taperModule().normalized_arc_positions(axisPointsMm), fractions)
+        capHeightFraction = float(parameterNode.flattenedCapHeightFraction)
         centerlineCurveNode = self._centerlineCurveNodeFromInput(centerlineNode)
         self._updateStentTransformNode(transformNode, centerlineCurveNode, axisPointsMm[0], axisPointsMm[-1],
-                                       capsuleRadiusCm * self._cmToMm, startRadiusMm, stentLengthMm)
+                                       capsuleRadiusCm * self._cmToMm, startRadiusMm, stentLengthMm, radiusProfile, capHeightFraction)
         if straightStentNode and straightStentNode.GetParentTransformNode() != transformNode:
             straightStentNode.SetAndObserveTransformNodeID(transformNode.GetID())
 
@@ -938,6 +1019,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         computeArrays = bool(parameterNode.computeOutputModelArrays)
         saveStep = float(parameterNode.saveStep)
         preserveTemporaryFiles = bool(parameterNode.preserveTemporaryFiles)
+        flareParameters = self._flareParametersFromNode(parameterNode)
+        flattenedCapHeightFraction = float(parameterNode.flattenedCapHeightFraction)
 
         if not inputVesselSegmentation or not inputVesselSegmentId or not inputCenterlineCurve:
             raise ValueError("Input surface segmentation/segment and centerline node are required")
@@ -986,6 +1069,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 targetRadius=targetRadius,
                 startRadius=startRadius,
                 stentLength=stentLength,
+                flareParameters=flareParameters,
+                flattenedCapHeightFraction=flattenedCapHeightFraction,
                 enableSnapshots=enableSnapshots,
                 verboseLogging=verboseLogging,
                 computeOutputModelArrays=computeArrays,
@@ -1014,6 +1099,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
         # --- Determine whether we can reuse the cached deployment state ---
 
+        # For a flared stent the intermediate deployment shapes depend on the flare/target radius
+        # ratio, so the ratio (rather than the absolute flare radius) is part of the state key:
+        # changing the target radius then invalidates the cache and restarts the deployment.
         stateKey = (
             inputVesselSegmentation.GetID(),
             inputVesselSegmentId,
@@ -1022,6 +1110,10 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             startPointId,
             round(startRadiusCm, 6),
             round(stentLengthCm, 6),
+            flareParameters["flaredEnd"] if flareParameters else "",
+            round(flareParameters["flareRadius"] / targetRadius, 6) if flareParameters else 0.0,
+            round(flareParameters["flareLength"], 6) if flareParameters else 0.0,
+            round(flattenedCapHeightFraction, 6),
         )
 
         state = self._deploymentState
@@ -1030,6 +1122,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             ctx = state["ctx"]
             axis_pts = state["axis_pts"]
             smoothing_k = state["smoothing_k"]
+            profileFractions = state.get("profileFractions")  # per-axis-vertex radius fractions, None for uniform radius
             ptCache = state["ptCache"]  # list of (displayed_R, surf_pts, cl_pts)
 
             lastCachedR = ptCache[-1][0]
@@ -1091,6 +1184,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 sampling_direction=-1,
             )
 
+            profileFractions = self._radiusProfileFractions(axis_pts, flareParameters, targetRadius)
+
             mesh_data.compute_material_constants(1.0, 0.2)
             smoothing_k = 0.01 * L()
             cur_R = startRadiusCm - smoothing_k
@@ -1102,6 +1197,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 "ctx": ctx,
                 "axis_pts": axis_pts,
                 "smoothing_k": smoothing_k,
+                "profileFractions": profileFractions,
                 "ptCache": ptCache,
             }
             self._deploymentState = state
@@ -1117,6 +1213,15 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             logging.info(f"Starting fresh deployment: start_R={startRadiusCm:.4f} cm, target_R={targetRadiusCm:.4f} cm")
 
         # --- Deployment loop ---
+        # Route svmorph's SDF-contact deployment through the tapered capsule-chain SDF that
+        # accepts a per-axis-vertex radius array and flattens all capsule end caps into half
+        # ellipsoids (allowing concave radius profiles, and flared ends without a protruding
+        # ball around the vessel beyond the stent end)
+        self._taperModule().install_tapered_sdf(flattenedCapHeightFraction)
+        if profileFractions is not None:
+            import numpy as np
+            maxProfileFraction = float(np.max(profileFractions))
+
         workDir = tempfile.mkdtemp(prefix="SDFStent_") if (enableSnapshots or preserveTemporaryFiles) else None
         shouldDeleteTemporaryFiles = not preserveTemporaryFiles
         try:
@@ -1148,6 +1253,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                     float(parameterNode.startRadius) != startRadiusAtStart
                     or float(parameterNode.stentLength) != stentLength
                     or currentCenterPos != centerPointPositionWorld
+                    or self._flareParametersFromNode(parameterNode) != flareParameters
+                    or (flareParameters is not None and float(parameterNode.targetRadius) != targetRadius)
+                    or float(parameterNode.flattenedCapHeightFraction) != flattenedCapHeightFraction
                 ):
                     raise SDFStentRestartError("Parameters changed during deployment")
 
@@ -1155,12 +1263,20 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 if latestTargetCm > targetRadiusCm:
                     targetRadiusCm = latestTargetCm
 
+                if profileFractions is None:
+                    currentStentRadius = cur_R
+                    boundingBoxRadiusCm = targetRadiusCm
+                else:
+                    # Scale the whole radius profile proportionally with the nominal radius, keeping
+                    # the smooth-min smoothing offset constant along the stent
+                    currentStentRadius = profileFractions * (cur_R + smoothing_k) - smoothing_k
+                    boundingBoxRadiusCm = maxProfileFraction * targetRadiusCm
                 surf_disp, cl_disp, dR = deformation.compute_sdf_contact_displacements(
                     ctx.data,
                     axis_pts,
                     s=-1.0,
-                    target_stent_radius=targetRadiusCm,
-                    current_stent_radius=cur_R,
+                    target_stent_radius=boundingBoxRadiusCm,
+                    current_stent_radius=currentStentRadius,
                 )
                 if cur_R + dR > targetRadiusCm:
                     logging.info("Next increment would overshoot target -- done.")
@@ -1316,6 +1432,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         targetRadius: float,
         startRadius: float,
         stentLength: float,
+        flareParameters: dict | None,
+        flattenedCapHeightFraction: float,
         enableSnapshots: bool,
         verboseLogging: bool,
         computeOutputModelArrays: bool,
@@ -1347,6 +1465,10 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 "targetRadius": targetRadius,
                 "startRadius": startRadius,
                 "stentLength": stentLength,
+                "flaredEnd": flareParameters["flaredEnd"] if flareParameters else "None",
+                "flareRadius": flareParameters["flareRadius"] if flareParameters else 0.0,
+                "flareLength": flareParameters["flareLength"] if flareParameters else 0.0,
+                "flattenedCapHeightFraction": flattenedCapHeightFraction,
                 "startPointId": startPointId,
                 "verboseLogging": verboseLogging,
                 "enableSnapshots": enableSnapshots,
@@ -1430,7 +1552,54 @@ class SDFStentTest(ScriptedLoadableModuleTest):
 
     def runTest(self):
         self.setUp()
+        self.test_SDFStent_taperedSdfConcaveProfile()
+        self.setUp()
         self.test_SDFStent_deployVessel01()
+        self.setUp()
+        self.test_SDFStent_deployVessel01Flared()
+
+    def test_SDFStent_taperedSdfConcaveProfile(self):
+        """The tapered capsule-chain SDF must preserve a concave (dumbbell) radius profile.
+        With svmorph's spherical end caps the wide capsules would bulge into the narrow waist
+        (reaching radius ~1.09 in the geometry below); the flattened caps keep the waist open."""
+        import numpy as np
+
+        if not importlib.util.find_spec("svmorph"):
+            self.delayDisplay("Installing svmorph...")
+            slicer.util.pip_install("svmorph")
+
+        logic = SDFStentLogic()
+        logic._taperModule().install_tapered_sdf()
+        from svmorph.core import deformation
+        from svmorph.core.units import set_unit_scale
+        set_unit_scale(1.0)
+
+        # Straight axis along z (cm) with a dumbbell profile: wide - narrow waist - wide
+        numberOfVertices = 21
+        axisPoints = np.zeros((numberOfVertices, 3))
+        axisPoints[:, 2] = np.arange(numberOfVertices) * 0.1
+        radii = np.full(numberOfVertices, 1.2)
+        radii[6:15] = 0.5  # waist between z=0.6 and z=1.4
+
+        # Find the surface (zero crossing of the SDF) along a radial ray at the waist center
+        queryRadialDistances = np.linspace(0.01, 2.0, 400)
+        queryPoints = np.zeros((len(queryRadialDistances), 3))
+        queryPoints[:, 0] = queryRadialDistances
+        queryPoints[:, 2] = 1.0
+        distances, unusedDirections = deformation.smin_sdf_capsule_contact_sculpt(queryPoints, axisPoints, radii)
+        surfaceRadiusAtWaist = queryRadialDistances[np.argmin(np.abs(np.asarray(distances)[:, 0]))]
+        self.assertGreater(surfaceRadiusAtWaist, 0.35)
+        self.assertLess(surfaceRadiusAtWaist, 0.7)
+
+        # The cap height fraction is adjustable: 1.0 restores spherical caps, and the wide
+        # capsules' caps then fill the waist in
+        logic._taperModule().install_tapered_sdf(1.0)
+        distances, unusedDirections = deformation.smin_sdf_capsule_contact_sculpt(queryPoints, axisPoints, radii)
+        sphericalSurfaceRadiusAtWaist = queryRadialDistances[np.argmin(np.abs(np.asarray(distances)[:, 0]))]
+        self.assertGreater(sphericalSurfaceRadiusAtWaist, 1.0)
+        logic._taperModule().install_tapered_sdf()  # restore the default
+
+        self.delayDisplay("SDFStent tapered SDF concave profile test passed")
 
     def test_SDFStent_deployVessel01(self):
         import numpy as np
@@ -1578,3 +1747,77 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         os.remove(transformFilePath)
 
         self.delayDisplay("SDFStent Vessel01 deployment test passed")
+
+    def test_SDFStent_deployVessel01Flared(self):
+        """Deploy a stent with a flared (trumpet shaped) end and verify that the vessel is
+        expanded beyond the target radius at the flared end only."""
+        import numpy as np
+        from vtk.util.numpy_support import vtk_to_numpy
+
+        if not importlib.util.find_spec("svmorph"):
+            self.delayDisplay("Installing svmorph...")
+            slicer.util.pip_install("svmorph")
+
+        self.delayDisplay("Loading Vessel01 sample data")
+        import SampleData
+        loadedNodes = SampleData.SampleDataLogic().downloadSamples("Vessel01")
+        segmentationNode = next(node for node in loadedNodes if node.IsA("vtkMRMLSegmentationNode"))
+        centerlineNode = next(node for node in loadedNodes if node.IsA("vtkMRMLMarkupsCurveNode"))
+        segmentId = segmentationNode.GetSegmentation().GetNthSegmentID(0)
+        segmentationNode.GetDisplayNode().SetOpacity3D(0.5)
+
+        logic = SDFStentLogic()
+        parameterNode = logic.getParameterNode()
+        parameterNode.inputVesselSegmentation = segmentationNode
+        parameterNode.inputVesselSegmentId = segmentId
+        parameterNode.inputCenterlineCurve = centerlineNode
+        centerPointNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode", "CenterPoint")
+        centerPointNode.AddControlPointWorld(-32.3214, -54.5704, 113.5213)
+        parameterNode.centerPointMarkup = centerPointNode
+
+        parameterNode.startRadius = 3.0
+        parameterNode.targetRadius = 8.0
+        parameterNode.stentLength = 40.0
+        parameterNode.flaredEnd = "Centerline start"
+        parameterNode.flareRadius = 12.0
+        parameterNode.flareLength = 12.0
+
+        self.delayDisplay("Deploying flared stent")
+        outputSurfaceNode, unusedOutputCenterlineNode = logic.process()
+        self.assertAlmostEqual(logic.getParameterNode().actualRadius, parameterNode.targetRadius, delta=0.5)
+
+        if logic._deploymentState is None:
+            self.delayDisplay("Deployment ran in an external process; skipping axis-based radius checks")
+            return
+
+        # The stent axis is resampled walking backward along the centerline, so the last axis
+        # vertex is on the flared ("Centerline start") end.
+        axisPointsMm = np.asarray(logic._deploymentState["axis_pts"], dtype=float) * 10.0
+        outputSurfacePoints = vtk_to_numpy(outputSurfaceNode.GetPolyData().GetPoints().GetData())
+
+        def deployedRadiusAt(axisIndex):
+            # Smallest radial distance from the axis point to surface points within a thin slab
+            # around the axis point's cross-section plane (the local deployed vessel radius)
+            axisPoint = axisPointsMm[axisIndex]
+            neighborIndex = axisIndex + 1 if axisIndex < len(axisPointsMm) - 1 else axisIndex - 1
+            axisDirection = axisPointsMm[neighborIndex] - axisPoint
+            axisDirection = axisDirection / np.linalg.norm(axisDirection)
+            offsets = outputSurfacePoints - axisPoint
+            axialDistances = offsets @ axisDirection
+            slab = np.abs(axialDistances) < 1.0
+            radialOffsets = offsets[slab] - np.outer(axialDistances[slab], axisDirection)
+            return np.min(np.linalg.norm(radialOffsets, axis=1))
+
+        # Radius in the middle of the stent must reach the target radius
+        radiusAtMiddle = deployedRadiusAt(len(axisPointsMm) // 2)
+        self.assertAlmostEqual(radiusAtMiddle, parameterNode.targetRadius, delta=1.0)
+
+        # A few mm inside from the flared end (where the flare profile is ~10.5-11 mm) the
+        # vessel must be expanded well beyond the target radius reached in the stent middle
+        axisSpacingMm = np.linalg.norm(axisPointsMm[1] - axisPointsMm[0])
+        insideOffset = max(int(round(4.0 / axisSpacingMm)), 1)
+        radiusNearFlaredEnd = deployedRadiusAt(len(axisPointsMm) - 1 - insideOffset)
+        self.assertGreater(radiusNearFlaredEnd, radiusAtMiddle + 1.2)
+        self.assertGreater(radiusNearFlaredEnd, parameterNode.targetRadius + 0.8)
+
+        self.delayDisplay("SDFStent flared deployment test passed")

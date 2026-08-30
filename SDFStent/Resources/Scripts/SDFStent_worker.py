@@ -141,6 +141,10 @@ def main(workdir):
         target_radius_cm = float(params["targetRadius"]) * MM_TO_CM
         start_radius_cm = float(params["startRadius"]) * MM_TO_CM
         stent_length_cm = float(params["stentLength"]) * MM_TO_CM
+        flared_end = str(params.get("flaredEnd", "None"))
+        flare_radius_cm = float(params.get("flareRadius", 0.0)) * MM_TO_CM
+        flare_length_cm = float(params.get("flareLength", 0.0)) * MM_TO_CM
+        flattened_cap_height_fraction = float(params.get("flattenedCapHeightFraction", 0.35))
         start_point_id = int(params["startPointId"])
         verbose_logging = bool(params.get("verboseLogging", False))
         enable_snapshots = bool(params.get("enableSnapshots", False))
@@ -199,6 +203,21 @@ def main(workdir):
             sampling_direction=-1,
         )
 
+        # Deploy through the tapered capsule-chain SDF, which supports a per-axis-vertex radius
+        # profile and flattens all capsule end caps into half ellipsoids (allowing concave
+        # radius profiles, and flared ends without a protruding ball around the vessel beyond
+        # the stent end). Optional flared (funnel/trumpet) end: radius profile as fractions of
+        # the nominal target radius; the stent axis is resampled walking backward along the
+        # centerline, so its last vertex is on the centerline start side.
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import SDFStent_taper
+        SDFStent_taper.install_tapered_sdf(flattened_cap_height_fraction)
+        profile_fractions = None
+        if flared_end in ("Centerline start", "Centerline end"):
+            profile_fractions = SDFStent_taper.flare_profile_fractions(
+                axis_pts, target_radius_cm, flare_radius_cm, flare_length_cm,
+                flare_at_axis_start=(flared_end == "Centerline end"))
+
         mesh_data.compute_material_constants(1.0, 0.2)
         smoothing_k = 0.01 * L()
         cur_R = start_radius_cm - smoothing_k
@@ -219,12 +238,20 @@ def main(workdir):
         iteration = 0
         displayed_R = start_radius_cm
         while True:
+            if profile_fractions is None:
+                current_stent_radius = cur_R
+                bounding_box_radius_cm = target_radius_cm
+            else:
+                # Scale the whole radius profile proportionally with the nominal radius, keeping
+                # the smooth-min smoothing offset constant along the stent
+                current_stent_radius = profile_fractions * (cur_R + smoothing_k) - smoothing_k
+                bounding_box_radius_cm = float(profile_fractions.max()) * target_radius_cm
             surf_disp, cl_disp, dR = deformation.compute_sdf_contact_displacements(
                 ctx.data,
                 axis_pts,
                 s=-1.0,
-                target_stent_radius=target_radius_cm,
-                current_stent_radius=cur_R,
+                target_stent_radius=bounding_box_radius_cm,
+                current_stent_radius=current_stent_radius,
             )
             if cur_R + dR > target_radius_cm:
                 print(f"Step {iteration:3d}: next increment would overshoot target -- done.", flush=True)

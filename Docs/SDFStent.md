@@ -25,6 +25,19 @@ Simulate stent deployment using SDFStent algorithm (provided by [svMorph](https:
 
 ![](SDFStentAutoUpdate.jpg)
 
+## Flared (funnel/trumpet shaped) stent
+
+By default the stent radius is uniform along its length (svMorph's "pill" shape). One end of the stent can be flared into a funnel/trumpet shape:
+
+- `Flared end`: which end of the stent is flared, relative to the direction of the input centerline. `Centerline start` flares the stent end that is closer to the first point of the centerline curve; `Centerline end` flares the opposite end. Select `None` for a uniform-radius stent.
+- `Flare radius`: stent radius at the tip of the flared end (typically larger than the `Stent target radius`, but a smaller value can be used for a tapered stent).
+- `Flare length`: length of the transition from the `Stent target radius` to the `Flare radius`, measured along the centerline from the flared stent end. The transition uses a smoothstep profile.
+
+During deployment the whole radius profile is expanded proportionally, so when the stent body reaches the target radius, the flared end reaches the flare radius. The optional stent transform output warps the straight stent model accordingly, so a stent mesh transformed with it becomes flared as well.
+
+Internally the stent surface is modeled as a chain of tapered capsules: the signed distance field radius is defined per stent axis vertex and interpolated along the centerline, so arbitrary radius profiles (not just flares) can be produced programmatically via `SDFStent_taper.profile_fractions_from_control_points`. All capsule end caps (at both ends of every segment, including the two stent ends) are flattened half ellipsoids instead of svMorph's full spheres. This lets the radius profile express concave features — a wide capsule's spherical cap would otherwise bulge a full radius deep into a neighboring narrow region and wash the narrowing out — and rounds off a flared end smoothly without inflating a large spherical bulge around the vessel beyond the stent end. The cap height is adjustable in the Advanced section (`End cap height fraction`): the axial semi-axis of the caps as a fraction of the local stent radius, 0.35 by default; 1.0 reproduces svMorph's original spherical caps (pill shape).
+
+
 ## References
 
 [svMorph: Interactive geometry-editing tools for virtual patient-specific vascular anatomies](https://arxiv.org/abs/2210.07087)
