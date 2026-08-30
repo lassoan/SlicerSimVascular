@@ -37,6 +37,7 @@ During deployment the whole radius profile is expanded proportionally, so when t
 
 Internally the stent surface is modeled as a chain of tapered capsules: the signed distance field radius is defined per stent axis vertex and interpolated along the centerline, so arbitrary radius profiles (not just flares) can be produced programmatically via `SDFStent_taper.profile_fractions_from_control_points`. All capsule end caps (at both ends of every segment, including the two stent ends) are flattened half ellipsoids instead of svMorph's full spheres. This lets the radius profile express concave features — a wide capsule's spherical cap would otherwise bulge a full radius deep into a neighboring narrow region and wash the narrowing out — and rounds off a flared end smoothly without inflating a large spherical bulge around the vessel beyond the stent end. The cap height is adjustable in the Advanced section (`End cap height fraction`): the axial semi-axis of the caps as a fraction of the local stent radius, 0.35 by default; 1.0 reproduces svMorph's original spherical caps (pill shape).
 
+For debugging and tweaking algorithm parameters, the Advanced section's `Output stent capsules model` shows this stent SDF geometry directly: the chain of tapered capsules is appended into a single model with a `CapsuleId` point scalar (the index of the capsule along the stent axis). The model is colored by capsule ID and shown semi-transparently by default, and updates live during deployment.
 
 ## References
 
