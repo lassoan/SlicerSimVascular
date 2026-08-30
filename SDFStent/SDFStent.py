@@ -120,6 +120,7 @@ class SDFStentParameterNode:
     outputCenterlineModel: Optional[vtkMRMLModelNode] = None
     outputStentTransform: Optional[vtkMRMLTransformNode] = None
     outputStraightStentModel: Optional[vtkMRMLModelNode] = None
+    outputStentCapsulesModel: Optional[vtkMRMLModelNode] = None
     actualRadius: Annotated[float, WithinRange(0.0, 30.0)] = 0.0
 
 
@@ -903,14 +904,113 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         combinedTransform.Concatenate(bsplineTransform)  # applied first (in model coordinate system)
         transformNode.SetAndObserveTransformToParent(combinedTransform)
 
+    def _stentCapsulesPolyData(self, axisPointsMm, capsuleRadiiMm, capHeightFraction: float) -> vtk.vtkPolyData:
+        """Debug view of the stent SDF geometry: the chain of tapered capsules appended into a
+        single polydata, with a "CapsuleId" point data array (index of the capsule segment along
+        the stent axis) for coloring. Each capsule is a cone frustum between consecutive axis
+        vertices plus the cap at its first vertex (a cap at a shared interior vertex also serves
+        as the end cap of the previous capsule, so it is not duplicated); a final cap closes the
+        last capsule. Matching the deployment SDF, each cap is a sphere flattened axially into
+        an ellipsoid whose semi-axis along the local stent axis direction is capHeightFraction
+        of the local radius."""
+        import numpy as np
+
+        axisPointsMm = np.asarray(axisPointsMm, dtype=float)
+        capsuleRadiiMm = np.asarray(capsuleRadiiMm, dtype=float)
+        numberOfCapsules = len(axisPointsMm) - 1
+        appendFilter = vtk.vtkAppendPolyData()
+
+        def addPiece(pieceSource, capsuleId):
+            pieceSource.Update()
+            piece = vtk.vtkPolyData()
+            piece.ShallowCopy(pieceSource.GetOutput())
+            idArray = vtk.vtkIntArray()
+            idArray.SetName("CapsuleId")
+            idArray.SetNumberOfValues(piece.GetNumberOfPoints())
+            idArray.Fill(capsuleId)
+            piece.GetPointData().AddArray(idArray)
+            appendFilter.AddInputData(piece)
+
+        def capSource(vertexIndex):
+            # Cap at an axis vertex: a sphere flattened axially (along the local stent axis
+            # direction) into an ellipsoid, matching the deployment SDF's flattened capsule caps
+            sphere = vtk.vtkSphereSource()
+            sphere.SetRadius(capsuleRadiiMm[vertexIndex])
+            sphere.SetThetaResolution(24)
+            sphere.SetPhiResolution(12)
+            axisDirection = (axisPointsMm[min(vertexIndex + 1, numberOfCapsules)]
+                             - axisPointsMm[max(vertexIndex - 1, 0)])
+            axisDirection = axisDirection / np.linalg.norm(axisDirection)
+            rotationAxis = np.cross([0.0, 0.0, 1.0], axisDirection)
+            rotationAngleDeg = np.degrees(np.arctan2(np.linalg.norm(rotationAxis), axisDirection[2]))
+            if np.linalg.norm(rotationAxis) < 1e-9:
+                rotationAxis = [1.0, 0.0, 0.0]
+            transform = vtk.vtkTransform()
+            transform.Translate(axisPointsMm[vertexIndex])
+            transform.RotateWXYZ(rotationAngleDeg, rotationAxis)
+            transform.Scale(1.0, 1.0, capHeightFraction)
+            transformFilter = vtk.vtkTransformPolyDataFilter()
+            transformFilter.SetTransform(transform)
+            transformFilter.SetInputConnection(sphere.GetOutputPort())
+            return transformFilter
+
+        def frustumSource(capsuleIndex):
+            # Cone frustum between consecutive axis vertices with linearly interpolated radius
+            linePolyData = vtk.vtkPolyData()
+            linePoints = vtk.vtkPoints()
+            linePoints.InsertNextPoint(axisPointsMm[capsuleIndex])
+            linePoints.InsertNextPoint(axisPointsMm[capsuleIndex + 1])
+            linePolyData.SetPoints(linePoints)
+            line = vtk.vtkCellArray()
+            line.InsertNextCell(2)
+            line.InsertCellPoint(0)
+            line.InsertCellPoint(1)
+            linePolyData.SetLines(line)
+            radiusArray = vtk.vtkFloatArray()
+            radiusArray.SetName("Radius")
+            radiusArray.InsertNextValue(capsuleRadiiMm[capsuleIndex])
+            radiusArray.InsertNextValue(capsuleRadiiMm[capsuleIndex + 1])
+            linePolyData.GetPointData().SetScalars(radiusArray)
+            tube = vtk.vtkTubeFilter()
+            tube.SetInputData(linePolyData)
+            tube.SetNumberOfSides(24)
+            tube.SetVaryRadiusToVaryRadiusByAbsoluteScalar()
+            tube.CappingOff()
+            return tube
+
+        for capsuleIndex in range(numberOfCapsules):
+            addPiece(capSource(capsuleIndex), capsuleIndex)
+            addPiece(frustumSource(capsuleIndex), capsuleIndex)
+        addPiece(capSource(numberOfCapsules), numberOfCapsules - 1)
+
+        appendFilter.Update()
+        capsulesPolyData = vtk.vtkPolyData()
+        capsulesPolyData.DeepCopy(appendFilter.GetOutput())
+        capsulesPolyData.GetPointData().SetActiveScalars("CapsuleId")
+        return capsulesPolyData
+
+    def _updateStentCapsulesModelNode(self, capsulesNode: vtkMRMLModelNode, axisPointsMm, capsuleRadiiMm, capHeightFraction: float) -> None:
+        """Update the stent capsules debug model node; on first display, color by the CapsuleId
+        point scalar and make the model semi-transparent."""
+        self._setModelNodePolyData(capsulesNode, self._stentCapsulesPolyData(axisPointsMm, capsuleRadiiMm, capHeightFraction))
+        if not capsulesNode.GetDisplayNode():
+            capsulesNode.CreateDefaultDisplayNodes()
+            displayNode = capsulesNode.GetDisplayNode()
+            displayNode.SetOpacity(0.4)
+            displayNode.SetAndObserveColorNodeID("vtkMRMLColorTableNodeRainbow")
+            displayNode.SetActiveScalar("CapsuleId", vtk.vtkAssignAttribute.POINT_DATA)
+            displayNode.SetScalarVisibility(True)
+
     def _updateOptionalStentOutputs(self, parameterNode: SDFStentParameterNode, axisPointsCm, centerlineNode: vtkMRMLNode, capsuleRadiusCm: float, startRadiusMm: float, stentLengthMm: float) -> None:
-        """Update the optional straight stent model and stent transform outputs (skipped when not selected)."""
+        """Update the optional straight stent model, stent transform, and stent capsules debug
+        model outputs (each skipped when not selected)."""
         straightStentNode = parameterNode.outputStraightStentModel
         if straightStentNode:
             self._setDisplayedPolyData(straightStentNode, self._straightStentPolyData(startRadiusMm, stentLengthMm),
                                        defaultOpacity=0.8, defaultColor=(0.8, 0.8, 0.9))
         transformNode = parameterNode.outputStentTransform
-        if not transformNode:
+        capsulesNode = parameterNode.outputStentCapsulesModel
+        if not transformNode and not capsulesNode:
             return
         import numpy as np
         axisPointsMm = np.asarray(axisPointsCm, dtype=float) * self._cmToMm
@@ -920,11 +1020,15 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             fractions = self._radiusProfileFractions(axisPointsCm, flareParameters, parameterNode.targetRadius)
             radiusProfile = (self._taperModule().normalized_arc_positions(axisPointsMm), fractions)
         capHeightFraction = float(parameterNode.flattenedCapHeightFraction)
-        centerlineCurveNode = self._centerlineCurveNodeFromInput(centerlineNode)
-        self._updateStentTransformNode(transformNode, centerlineCurveNode, axisPointsMm[0], axisPointsMm[-1],
-                                       capsuleRadiusCm * self._cmToMm, startRadiusMm, stentLengthMm, radiusProfile, capHeightFraction)
-        if straightStentNode and straightStentNode.GetParentTransformNode() != transformNode:
-            straightStentNode.SetAndObserveTransformNodeID(transformNode.GetID())
+        if capsulesNode:
+            capsuleRadiiMm = capsuleRadiusCm * self._cmToMm * (radiusProfile[1] if radiusProfile is not None else np.ones(len(axisPointsMm)))
+            self._updateStentCapsulesModelNode(capsulesNode, axisPointsMm, capsuleRadiiMm, capHeightFraction)
+        if transformNode:
+            centerlineCurveNode = self._centerlineCurveNodeFromInput(centerlineNode)
+            self._updateStentTransformNode(transformNode, centerlineCurveNode, axisPointsMm[0], axisPointsMm[-1],
+                                           capsuleRadiusCm * self._cmToMm, startRadiusMm, stentLengthMm, radiusProfile, capHeightFraction)
+            if straightStentNode and straightStentNode.GetParentTransformNode() != transformNode:
+                straightStentNode.SetAndObserveTransformNodeID(transformNode.GetID())
 
     def _setModelNodePolyData(self, node: vtkMRMLModelNode, polyData: vtk.vtkPolyData) -> None:
         """Set the polydata on the model node, unless the node already holds this same object
@@ -1781,6 +1885,7 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         parameterNode.flaredEnd = "Centerline start"
         parameterNode.flareRadius = 12.0
         parameterNode.flareLength = 12.0
+        parameterNode.outputStentCapsulesModel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "StentCapsules")
 
         self.delayDisplay("Deploying flared stent")
         outputSurfaceNode, unusedOutputCenterlineNode = logic.process()
@@ -1819,5 +1924,23 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         radiusNearFlaredEnd = deployedRadiusAt(len(axisPointsMm) - 1 - insideOffset)
         self.assertGreater(radiusNearFlaredEnd, radiusAtMiddle + 1.2)
         self.assertGreater(radiusNearFlaredEnd, parameterNode.targetRadius + 0.8)
+
+        # Stent capsules debug model: colored by a CapsuleId point scalar with one value per
+        # stent axis segment, and reaching out to the flare radius
+        capsulesPolyData = parameterNode.outputStentCapsulesModel.GetPolyData()
+        self.assertIsNotNone(capsulesPolyData)
+        self.assertGreater(capsulesPolyData.GetNumberOfPoints(), 0)
+        capsuleIdArray = capsulesPolyData.GetPointData().GetArray("CapsuleId")
+        self.assertIsNotNone(capsuleIdArray)
+        capsuleIds = vtk_to_numpy(capsuleIdArray)
+        self.assertEqual(capsuleIds.min(), 0)
+        self.assertEqual(capsuleIds.max(), len(axisPointsMm) - 2)
+        capsulesPoints = vtk_to_numpy(capsulesPolyData.GetPoints().GetData())
+        flaredEndDistances = np.linalg.norm(capsulesPoints - axisPointsMm[-1], axis=1)
+        self.assertAlmostEqual(np.max(np.where(capsuleIds == capsuleIds.max(), flaredEndDistances, 0.0)),
+                               parameterNode.flareRadius, delta=1.5)
+        capsulesDisplayNode = parameterNode.outputStentCapsulesModel.GetDisplayNode()
+        self.assertTrue(capsulesDisplayNode.GetScalarVisibility())
+        self.assertLess(capsulesDisplayNode.GetOpacity(), 1.0)
 
         self.delayDisplay("SDFStent flared deployment test passed")
