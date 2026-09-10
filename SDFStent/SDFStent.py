@@ -23,6 +23,12 @@ from slicer.parameterNodeWrapper import (
 
 from slicer import vtkMRMLMarkupsCurveNode, vtkMRMLMarkupsFiducialNode, vtkMRMLMarkupsNode, vtkMRMLModelNode, vtkMRMLNode, vtkMRMLSegmentationNode, vtkMRMLTransformNode
 
+# svmorph with variable-radius stent support: tapered capsule-chain SDF (per-vertex radius
+# profile) with flattened half-ellipsoid end caps (cap_height_fraction).
+# TODO: replace with a plain "svmorph>=<version>" requirement once the variable-radius-stent
+# branch is merged upstream and released on PyPI.
+SVMORPH_PIP_SPEC = "svmorph @ https://github.com/lassoan/svMorph/archive/refs/heads/variable-radius-stent.zip"
+
 
 class SDFStent(ScriptedLoadableModule):
     def __init__(self, parent):
@@ -402,27 +408,17 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _ensureSvmorphInstalled(self) -> None:
         if self.logic._useExternalPythonEnv():
-            # Using external Python environment, no need to install svmorph in it
+            # Using external Python environment; svmorph is installed there on demand
             return
 
         if self._svmorphEnsured:
             return
 
-        if importlib.util.find_spec("svmorph"):
-            self._svmorphEnsured = True
-            return
+        def logAndShowStatus(message):
+            self._appendLog(message)
+            self._setStatus(message)
 
-        self._appendLog(_("svmorph is not installed. Installing svmorph..."))
-        self._setStatus(_("Installing svmorph..."))
-        try:
-            slicer.util.pip_install("svmorph")
-        except Exception as exc:
-            raise RuntimeError(_("Failed to install required dependency 'svmorph'.")) from exc
-
-        if not importlib.util.find_spec("svmorph"):
-            raise RuntimeError(_("Failed to verify 'svmorph' installation."))
-
-        self._appendLog(_("svmorph installation completed."))
+        self.logic.ensureSvmorph(logCallback=logAndShowStatus)
         self._svmorphEnsured = True
 
     def onApplyButton(self) -> None:
@@ -520,14 +516,58 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
     def getParameterNode(self):
         return SDFStentParameterNode(super().getParameterNode())
 
-    def _taperModule(self):
-        """Import the shared tapered-stent module (also used by the standalone worker script)."""
+    def ensureSvmorph(self, logCallback=None) -> None:
+        """Install or upgrade svmorph so that it provides variable-radius stent support
+        (tapered capsule-chain SDF with per-vertex radii and flattened end caps).
+        Must not be called when computations run in an external Python environment
+        (svmorph/jax may not be importable in Slicer's Python there)."""
+
+        def log(message):
+            logging.info(message)
+            if logCallback:
+                logCallback(message)
+
+        def hasVariableRadiusSupport():
+            import svmorph.core.geometry
+            return hasattr(svmorph.core.geometry, "flared_stent_radius_profile")
+
+        if importlib.util.find_spec("svmorph"):
+            if hasVariableRadiusSupport():
+                return
+            log(_("Installed svmorph lacks variable-radius stent support. Upgrading svmorph..."))
+            slicer.util.pip_uninstall("svmorph")
+        else:
+            log(_("svmorph is not installed. Installing svmorph..."))
+
+        try:
+            # The requirement is passed as a list so that the "name @ url" direct reference is
+            # kept as a single pip argument (a plain string would be split on whitespace).
+            # show_progress=False: plain blocking install without the modal progress dialog,
+            # which can stall when this runs outside an interactive session (e.g. in tests or
+            # scripts started with --python-script).
+            slicer.util.pip_install([SVMORPH_PIP_SPEC], show_progress=False)
+        except Exception as exc:
+            raise RuntimeError(_("Failed to install required dependency 'svmorph'.")) from exc
+
+        # Drop any previously imported (old) svmorph modules so that the upgraded package is used
         import sys
-        scriptsDir = os.path.join(os.path.dirname(__file__), "Resources", "Scripts")
-        if scriptsDir not in sys.path:
-            sys.path.insert(0, scriptsDir)
-        import SDFStent_taper
-        return SDFStent_taper
+        for moduleName in [name for name in sys.modules if name == "svmorph" or name.startswith("svmorph.")]:
+            del sys.modules[moduleName]
+
+        if not importlib.util.find_spec("svmorph") or not hasVariableRadiusSupport():
+            raise RuntimeError(_("Failed to verify 'svmorph' installation."))
+        log(_("svmorph installation completed."))
+
+    @staticmethod
+    def _normalizedArcPositions(points):
+        """Arc-length position of each stent axis vertex, normalized to [0, 1] from the first vertex."""
+        import numpy as np
+        points = np.asarray(points, dtype=float)
+        if len(points) < 2:
+            return np.zeros(len(points))
+        arcPositions = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
+        totalLength = arcPositions[-1]
+        return arcPositions / totalLength if totalLength > 0.0 else arcPositions
 
     def _flareParametersFromNode(self, parameterNode: SDFStentParameterNode) -> dict | None:
         """Flare parameters (in mm) from the parameter node, or None when no end is flared."""
@@ -544,16 +584,22 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         """Per-axis-vertex stent radius profile as dimensionless fractions of the nominal target
         radius, or None for a uniform-radius (pill shaped) stent. The stent axis is resampled
         walking backward along the centerline (toward its first point), so the first axis vertex
-        is on the centerline end side and the last axis vertex on the centerline start side."""
+        is on the centerline end side and the last axis vertex on the centerline start side.
+        Pure numpy re-implementation of svmorph.core.geometry.flared_stent_radius_profile (as
+        fractions): svmorph itself is not imported here because this also runs for display
+        outputs on systems where the deployment uses an external Python environment and
+        svmorph/jax are not importable in Slicer's Python."""
         if not flareParameters:
             return None
+        import numpy as np
+        points = np.asarray(axisPointsCm, dtype=float)
+        arcPositions = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))))
         flareAtAxisStart = flareParameters["flaredEnd"] == "Centerline end"
-        return self._taperModule().flare_profile_fractions(
-            axisPointsCm,
-            float(targetRadiusMm) * self._mmToCm,
-            flareParameters["flareRadius"] * self._mmToCm,
-            flareParameters["flareLength"] * self._mmToCm,
-            flareAtAxisStart)
+        distanceFromFlaredEnd = arcPositions if flareAtAxisStart else arcPositions[-1] - arcPositions
+        t = np.clip(1.0 - distanceFromFlaredEnd / (flareParameters["flareLength"] * self._mmToCm), 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t)  # smoothstep
+        flareFraction = flareParameters["flareRadius"] / float(targetRadiusMm)
+        return 1.0 + (flareFraction - 1.0) * t
 
     def _scaledPolyData(self, polyData: vtk.vtkPolyData, scaleFactor: float) -> vtk.vtkPolyData:
         transform = vtk.vtkTransform()
@@ -788,9 +834,9 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         coordinate system) bends the tube along the centerline and expands it to the deployed radius
         (with axial foreshortening). Beyond the stent length the warp follows the centerline continuation
         without radial expansion or foreshortening, with a smooth transition near the stent ends that
-        follows the flattened half-ellipsoid end cap profile of the deployed stent (matching
-        SDFStent_taper.install_tapered_sdf). Positions and parallel transport frames along the
-        centerline are provided by the curve node.
+        follows the flattened half-ellipsoid end cap profile of the deployed stent (matching the
+        cap_height_fraction convention of svmorph's tapered capsule-chain SDF). Positions and
+        parallel transport frames along the centerline are provided by the curve node.
         radiusProfile optionally describes a variable stent radius (e.g. a flared end) as a tuple of
         (normalized arc positions from the stent axis start, radius fractions of capsuleRadiusMm).
         capHeightFraction is the axial semi-axis of the flattened half-ellipsoid end caps as a
@@ -1030,7 +1076,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         flareParameters = self._flareParametersFromNode(parameterNode)
         if flareParameters:
             fractions = self._radiusProfileFractions(axisPointsCm, flareParameters, parameterNode.targetRadius)
-            radiusProfile = (self._taperModule().normalized_arc_positions(axisPointsMm), fractions)
+            radiusProfile = (self._normalizedArcPositions(axisPointsMm), fractions)
         capHeightFraction = float(parameterNode.flattenedCapHeightFraction)
         if capsulesNode:
             capsuleRadiiMm = capsuleRadiusCm * self._cmToMm * (radiusProfile[1] if radiusProfile is not None else np.ones(len(axisPointsMm)))
@@ -1329,11 +1375,6 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             logging.info(f"Starting fresh deployment: start_R={startRadiusCm:.4f} cm, target_R={targetRadiusCm:.4f} cm")
 
         # --- Deployment loop ---
-        # Route svmorph's SDF-contact deployment through the tapered capsule-chain SDF that
-        # accepts a per-axis-vertex radius array and flattens all capsule end caps into half
-        # ellipsoids (allowing concave radius profiles, and flared ends without a protruding
-        # ball around the vessel beyond the stent end)
-        self._taperModule().install_tapered_sdf(flattenedCapHeightFraction)
         if profileFractions is not None:
             import numpy as np
             maxProfileFraction = float(np.max(profileFractions))
@@ -1393,6 +1434,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                     s=-1.0,
                     target_stent_radius=boundingBoxRadiusCm,
                     current_stent_radius=currentStentRadius,
+                    cap_height_fraction=flattenedCapHeightFraction,
                 )
                 if cur_R + dR > targetRadiusCm:
                     logging.info("Next increment would overshoot target -- done.")
@@ -1506,20 +1548,30 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
     def _ensureExternalDependencies(self, pythonCmd: list, env: dict, processMessageCallback) -> None:
         import subprocess
-        required = [("svmorph", "svmorph")]
-        for importName, pipName in required:
+        # (feature check statement, uninstall-first package name or None, pip requirement)
+        required = [
+            ("from svmorph.core.geometry import flared_stent_radius_profile", "svmorph", SVMORPH_PIP_SPEC),
+        ]
+        for checkStatement, packageName, pipRequirement in required:
             check = subprocess.run(
-                pythonCmd + ["-c", f"import {importName}"],
+                pythonCmd + ["-c", checkStatement],
                 capture_output=True, text=True, env=env,
             )
             if check.returncode == 0:
                 continue
-            msg = f"Installing {pipName} in external Python environment..."
+            # Uninstall a potentially outdated package first so that pip installs the
+            # required version even when the version numbers match
+            if packageName:
+                subprocess.run(
+                    pythonCmd + ["-m", "pip", "uninstall", "-y", packageName],
+                    capture_output=True, text=True, env=env,
+                )
+            msg = f"Installing {pipRequirement} in external Python environment..."
             logging.info(msg)
             if processMessageCallback:
                 processMessageCallback(msg, False)
             proc = subprocess.Popen(
-                pythonCmd + ["-m", "pip", "install", pipName],
+                pythonCmd + ["-m", "pip", "install", pipRequirement],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1533,10 +1585,16 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                 slicer.app.processEvents()
             proc.wait()
             if proc.returncode != 0:
-                raise RuntimeError(f"Failed to install '{pipName}' in the external Python environment.")
-            logging.info(f"Successfully installed {pipName}.")
+                raise RuntimeError(f"Failed to install '{pipRequirement}' in the external Python environment.")
+            verify = subprocess.run(
+                pythonCmd + ["-c", checkStatement],
+                capture_output=True, text=True, env=env,
+            )
+            if verify.returncode != 0:
+                raise RuntimeError(f"Failed to verify '{pipRequirement}' in the external Python environment.")
+            logging.info(f"Successfully installed {pipRequirement}.")
             if processMessageCallback:
-                processMessageCallback(f"Successfully installed {pipName}.", False)
+                processMessageCallback(f"Successfully installed {pipRequirement}.", False)
 
     def _processWithExternalPython(
         self,
@@ -1717,17 +1775,14 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         self.delayDisplay("SDFStent transform flattened caps test passed")
 
     def test_SDFStent_taperedSdfConcaveProfile(self):
-        """The tapered capsule-chain SDF must preserve a concave (dumbbell) radius profile.
-        With svmorph's spherical end caps the wide capsules would bulge into the narrow waist
-        (reaching radius ~1.09 in the geometry below); the flattened caps keep the waist open."""
+        """svmorph's tapered capsule-chain SDF must preserve a concave (dumbbell) radius
+        profile when the end caps are flattened. With the classic spherical end caps the wide
+        capsules bulge into the narrow waist (reaching radius ~1.09 in the geometry below);
+        flattened caps keep the waist open. Also verifies that the installed svmorph provides
+        the variable-radius stent API used by this module."""
         import numpy as np
 
-        if not importlib.util.find_spec("svmorph"):
-            self.delayDisplay("Installing svmorph...")
-            slicer.util.pip_install("svmorph")
-
-        logic = SDFStentLogic()
-        logic._taperModule().install_tapered_sdf()
+        SDFStentLogic().ensureSvmorph(logCallback=self.delayDisplay)
         from svmorph.core import deformation
         from svmorph.core.units import set_unit_scale
         set_unit_scale(1.0)
@@ -1744,18 +1799,18 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         queryPoints = np.zeros((len(queryRadialDistances), 3))
         queryPoints[:, 0] = queryRadialDistances
         queryPoints[:, 2] = 1.0
-        distances, unusedDirections = deformation.smin_sdf_capsule_contact_sculpt(queryPoints, axisPoints, radii)
+        distances, unusedDirections = deformation.smin_sdf_capsule_contact_sculpt(
+            queryPoints, axisPoints, radii, 0.35)
         surfaceRadiusAtWaist = queryRadialDistances[np.argmin(np.abs(np.asarray(distances)[:, 0]))]
         self.assertGreater(surfaceRadiusAtWaist, 0.35)
         self.assertLess(surfaceRadiusAtWaist, 0.7)
 
-        # The cap height fraction is adjustable: 1.0 restores spherical caps, and the wide
+        # The cap height fraction default (1.0) keeps the classic spherical caps, and the wide
         # capsules' caps then fill the waist in
-        logic._taperModule().install_tapered_sdf(1.0)
-        distances, unusedDirections = deformation.smin_sdf_capsule_contact_sculpt(queryPoints, axisPoints, radii)
+        distances, unusedDirections = deformation.smin_sdf_capsule_contact_sculpt(
+            queryPoints, axisPoints, radii)
         sphericalSurfaceRadiusAtWaist = queryRadialDistances[np.argmin(np.abs(np.asarray(distances)[:, 0]))]
         self.assertGreater(sphericalSurfaceRadiusAtWaist, 1.0)
-        logic._taperModule().install_tapered_sdf()  # restore the default
 
         self.delayDisplay("SDFStent tapered SDF concave profile test passed")
 
@@ -1763,9 +1818,7 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         import numpy as np
         from vtk.util.numpy_support import vtk_to_numpy
 
-        if not importlib.util.find_spec("svmorph"):
-            self.delayDisplay("Installing svmorph...")
-            slicer.util.pip_install("svmorph")
+        SDFStentLogic().ensureSvmorph(logCallback=self.delayDisplay)
 
         self.delayDisplay("Loading Vessel01 sample data")
         import SampleData
@@ -1912,9 +1965,7 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         import numpy as np
         from vtk.util.numpy_support import vtk_to_numpy
 
-        if not importlib.util.find_spec("svmorph"):
-            self.delayDisplay("Installing svmorph...")
-            slicer.util.pip_install("svmorph")
+        SDFStentLogic().ensureSvmorph(logCallback=self.delayDisplay)
 
         self.delayDisplay("Loading Vessel01 sample data")
         import SampleData
