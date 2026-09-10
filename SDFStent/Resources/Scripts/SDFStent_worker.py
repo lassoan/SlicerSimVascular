@@ -203,20 +203,18 @@ def main(workdir):
             sampling_direction=-1,
         )
 
-        # Deploy through the tapered capsule-chain SDF, which supports a per-axis-vertex radius
-        # profile and flattens all capsule end caps into half ellipsoids (allowing concave
-        # radius profiles, and flared ends without a protruding ball around the vessel beyond
-        # the stent end). Optional flared (funnel/trumpet) end: radius profile as fractions of
-        # the nominal target radius; the stent axis is resampled walking backward along the
-        # centerline, so its last vertex is on the centerline start side.
-        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-        import SDFStent_taper
-        SDFStent_taper.install_tapered_sdf(flattened_cap_height_fraction)
+        # Optional flared (funnel/trumpet) end: per-axis-vertex radius profile as fractions of
+        # the nominal target radius, deployed through svmorph's tapered capsule-chain SDF
+        # (with flattened half-ellipsoid end caps controlled by cap_height_fraction). The
+        # stent axis is resampled walking backward along the centerline, so its last vertex is
+        # on the centerline start side.
+        import numpy as np
         profile_fractions = None
         if flared_end in ("Centerline start", "Centerline end"):
-            profile_fractions = SDFStent_taper.flare_profile_fractions(
-                axis_pts, target_radius_cm, flare_radius_cm, flare_length_cm,
+            target_radii = geometry.flared_stent_radius_profile(
+                np.asarray(axis_pts), target_radius_cm, flare_radius_cm, flare_length_cm,
                 flare_at_axis_start=(flared_end == "Centerline end"))
+            profile_fractions = target_radii / target_radius_cm
 
         mesh_data.compute_material_constants(1.0, 0.2)
         smoothing_k = 0.01 * L()
@@ -252,6 +250,7 @@ def main(workdir):
                 s=-1.0,
                 target_stent_radius=bounding_box_radius_cm,
                 current_stent_radius=current_stent_radius,
+                cap_height_fraction=flattened_cap_height_fraction,
             )
             if cur_R + dR > target_radius_cm:
                 print(f"Step {iteration:3d}: next increment would overshoot target -- done.", flush=True)
