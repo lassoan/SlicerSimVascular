@@ -456,6 +456,17 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._onInputSurfaceChanged()
                 self._onInputCenterlineNodeChanged(self.ui.inputCenterlineSelector.currentNode())
 
+                if self.logic.runsAsJob():
+                    # In a browser the deployment runs in a worker of the page: it is started here
+                    # and ends in _onDeploymentFinished, so that the views keep drawing meanwhile
+                    # and Cancel can be pressed.
+                    self.logic.process(
+                        processMessageCallback=self._handleProcessMessage,
+                        onFinished=lambda error: self._onDeploymentFinished(
+                            error, targetRadiusAtStart, startRadiusAtStart, stentLengthAtStart,
+                            flareParametersAtStart, centerPointPositionAtStart))
+                    return
+
                 self.logic.process(processMessageCallback=self._handleProcessMessage)
 
                 actualRadius = self._parameterNode.actualRadius if self._parameterNode else 0.0
@@ -474,22 +485,56 @@ class SDFStentWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._isProcessing = False
                 self._checkCanApply()
                 if not cancelledByUser:
-                    currentCenterPointPosition = [0.0, 0.0, 0.0]
-                    currentCenterPointNode = self.ui.startPointPlaceWidget.currentNode()
-                    if currentCenterPointNode and currentCenterPointNode.GetNumberOfControlPoints() > 0:
-                        currentCenterPointNode.GetNthControlPointPositionWorld(0, currentCenterPointPosition)
-                    inputsChanged = (
-                        float(self.ui.targetRadiusSpinBox.value) != targetRadiusAtStart
-                        or float(self.ui.startRadiusSpinBox.value) != startRadiusAtStart
-                        or float(self.ui.stentLengthSpinBox.value) != stentLengthAtStart
-                        or self._currentFlareParameters() != flareParametersAtStart
-                        or currentCenterPointPosition != centerPointPositionAtStart
-                    )
-                    if inputsChanged:
-                        if self.ui.updateButton.enabled:
-                            self.onApplyButton()
-                        else:
-                            self._autoUpdateIfEnabled()
+                    self._restartIfInputsChanged(targetRadiusAtStart, startRadiusAtStart, stentLengthAtStart,
+                                                 flareParametersAtStart, centerPointPositionAtStart)
+
+
+    def _onDeploymentFinished(self, error, targetRadiusAtStart, startRadiusAtStart, stentLengthAtStart,
+                              flareParametersAtStart, centerPointPositionAtStart) -> None:
+        """End of a deployment that ran in a worker of the page: what the blocking path does in its
+        except and finally blocks (see onApplyButton)."""
+        cancelledByUser = isinstance(error, SDFStentCancelledError)
+        if error is None:
+            actualRadius = self._parameterNode.actualRadius if self._parameterNode else 0.0
+            self._setStatus(_("Completed (R={radius:.2f} mm)").format(radius=actualRadius))
+        elif isinstance(error, SDFStentRestartError):
+            self._appendLog(_("Parameters changed, restarting deployment..."))
+            self._setStatus(_("Restarting..."))
+        elif cancelledByUser:
+            self._appendLog(_("Deployment cancelled by user."))
+            self._setStatus(_("Cancelled"))
+        else:
+            self._setStatus(_("Failed"))
+            slicer.util.errorDisplay(_("Failed to deploy stent: {error}").format(error=error),
+                                     detailedText=str(error))
+
+        self._isProcessing = False
+        self._checkCanApply()
+        if cancelledByUser:
+            return
+        self._restartIfInputsChanged(targetRadiusAtStart, startRadiusAtStart, stentLengthAtStart,
+                                     flareParametersAtStart, centerPointPositionAtStart)
+
+    def _restartIfInputsChanged(self, targetRadiusAtStart, startRadiusAtStart, stentLengthAtStart,
+                                flareParametersAtStart, centerPointPositionAtStart) -> None:
+        """Deploy again if something was changed while the last deployment was running."""
+        currentCenterPointPosition = [0.0, 0.0, 0.0]
+        currentCenterPointNode = self.ui.startPointPlaceWidget.currentNode()
+        if currentCenterPointNode and currentCenterPointNode.GetNumberOfControlPoints() > 0:
+            currentCenterPointNode.GetNthControlPointPositionWorld(0, currentCenterPointPosition)
+        inputsChanged = (
+            float(self.ui.targetRadiusSpinBox.value) != targetRadiusAtStart
+            or float(self.ui.startRadiusSpinBox.value) != startRadiusAtStart
+            or float(self.ui.stentLengthSpinBox.value) != stentLengthAtStart
+            or self._currentFlareParameters() != flareParametersAtStart
+            or currentCenterPointPosition != centerPointPositionAtStart
+        )
+        if not inputsChanged:
+            return
+        if self.ui.updateButton.enabled:
+            self.onApplyButton()
+        else:
+            self._autoUpdateIfEnabled()
 
 
 class SDFStentCancelledError(RuntimeError):
@@ -504,6 +549,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
     def __init__(self) -> None:
         ScriptedLoadableModuleLogic.__init__(self)
         self._cancelRequested = False
+        self._runningJob = False
         self._deploymentState = None
         self._temporaryCenterlineCurveNode = None
         self._temporaryCenterlineCurveSource = None
@@ -512,6 +558,12 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
     def requestCancel(self) -> None:
         self._cancelRequested = True
+        if self._runningJob:
+            # Python in a worker cannot be interrupted between bytecodes, so the worker is ended
+            # and the next run starts a new one.
+            from slicerweb import jobs
+
+            jobs.cancel()
 
     def getParameterNode(self):
         return SDFStentParameterNode(super().getParameterNode())
@@ -1166,8 +1218,15 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
         return int(pointIds[-1])
 
-    def process(self, processMessageCallback=None) -> tuple[vtkMRMLModelNode, vtkMRMLModelNode]:
-        """Run stent deployment. All inputs and parameters are taken from the module's parameter node."""
+    def process(self, processMessageCallback=None, onFinished=None) -> tuple[vtkMRMLModelNode, vtkMRMLModelNode]:
+        """Run stent deployment. All inputs and parameters are taken from the module's parameter node.
+
+        Where the deployment runs in a worker of the page (see runsAsJob) this starts the run and
+        returns the output nodes, which are filled when the run ends; *onFinished* is then called
+        with None, or with the error the run ended in. Everywhere else the run is carried out here,
+        so the method returns when it is done and raises what it ran into, and *onFinished* is not
+        used.
+        """
         parameterNode = self.getParameterNode()
         inputVesselSegmentation = parameterNode.inputVesselSegmentation
         inputVesselSegmentId = parameterNode.inputVesselSegmentId
@@ -1219,6 +1278,27 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         centerPointMarkup.GetNthControlPointPositionWorld(0, centerPointPositionWorld)
         centerPointPositionWorldCm = [c * self._mmToCm for c in centerPointPositionWorld]
         startPointId = self._startPointIdFromCenterAndLength(inputCenterlinePolyDataCm, centerPointPositionWorldCm, stentLengthCm)
+
+        if self.runsAsJob():
+            # In a browser the deployment runs in a worker of the page (see _processAsJob): it is
+            # started here and answered later, so that the views keep drawing while it runs.
+            self._processAsJob(
+                inputSurfacePolyDataMm=inputSurfacePolyData,
+                inputCenterlinePolyDataMm=inputCenterlinePolyData,
+                inputCenterlineCurveNode=inputCenterlineCurve,
+                params=self._workerParameters(
+                    targetRadius=targetRadius, startRadius=startRadius, stentLength=stentLength,
+                    flareParameters=flareParameters,
+                    flattenedCapHeightFraction=flattenedCapHeightFraction,
+                    startPointId=startPointId, verboseLogging=verboseLogging,
+                    enableSnapshots=enableSnapshots, computeOutputModelArrays=computeArrays,
+                    saveStep=saveStep),
+                startRadius=startRadius, stentLength=stentLength,
+                outputSurfaceModel=outputSurfaceNode, outputCenterlineModel=outputCenterlineNode,
+                preserveTemporaryFiles=preserveTemporaryFiles,
+                processMessageCallback=processMessageCallback,
+                onFinished=onFinished if onFinished else (lambda error: None))
+            return outputSurfaceNode, outputCenterlineNode
 
         if self._useExternalPythonEnv():
             pythonExePath = self._getMacOSExternalPythonPath(processMessageCallback)
@@ -1502,6 +1582,185 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
                         processMessageCallback(f"Preserved temporary files in: {workDir}", False)
 
 
+    @staticmethod
+    def runsAsJob() -> bool:
+        """Whether the deployment runs in a worker of the page, which is how a browser runs it.
+
+        A web page (SlicerWeb, where Slicer runs through Pyodide) cannot start a process, but it can
+        start a worker with a Python of its own and the same packages, so the same worker script
+        runs there and the page keeps drawing while it does.
+        """
+        try:
+            from slicerweb import jobs
+        except ImportError:
+            return False
+        return jobs.available()
+
+    def _processAsJob(self, *, inputSurfacePolyDataMm, inputCenterlinePolyDataMm, inputCenterlineCurveNode,
+                      params, startRadius, stentLength, outputSurfaceModel, outputCenterlineModel,
+                      preserveTemporaryFiles, processMessageCallback, onFinished) -> None:
+        """Start the deployment in a worker of the page and return at once.
+
+        Nothing waits for it: the page would stop drawing if it did. *onFinished* is called with
+        None when the deployed models are in the scene, or with the error the run ended in.
+        """
+        from slicerweb import jobs
+
+        workDir = tempfile.mkdtemp(prefix="SDFStent_")
+        workDirPath = pathlib.Path(workDir)
+        self._writeWorkerInputs(workDirPath, inputSurfacePolyDataMm, inputCenterlinePolyDataMm, params)
+        inputNames = ("surface_input.vtp", "centerline_input.vtp", "params.json")
+        outputNames = ("surface_output.vtp", "centerline_output.vtp", "stent_axis.json", "result.json")
+        files = {str(workDirPath / name): (workDirPath / name).read_bytes() for name in inputNames}
+
+        # The worker runs the script that a subprocess would run, with the same command line, and
+        # what it prints arrives line by line as it does from a process.
+        code = (
+            "import runpy, sys\n"
+            "import slicerweb_job as job\n"
+            "class _Out:\n"
+            "    def write(self, text):\n"
+            "        for line in text.splitlines():\n"
+            "            if line:\n"
+            "                job.log('INFO', line)\n"
+            "        return len(text)\n"
+            "    def flush(self):\n"
+            "        pass\n"
+            "sys.argv = list(argv)\n"
+            "sys.stdout = sys.stderr = _Out()\n"
+            "try:\n"
+            "    runpy.run_path(argv[0], run_name='__main__')\n"
+            "except SystemExit as exit:\n"
+            "    result = int(exit.code or 0)\n"
+            "else:\n"
+            "    result = 0\n"
+        )
+
+        def finished(error):
+            self._runningJob = False
+            if preserveTemporaryFiles:
+                logging.info(f"Preserved temporary files in: {workDir}")
+            else:
+                shutil.rmtree(workDir, ignore_errors=True)
+            onFinished(error)
+
+        def done(result, returnedFiles):
+            error = None
+            try:
+                # A run in a worker brings its files back rather than leaving them on a disk of its own
+                for path, data in (returnedFiles or {}).items():
+                    with open(path, "wb") as handle:
+                        handle.write(data)
+                if self._cancelRequested:
+                    raise SDFStentCancelledError("Deployment cancelled by user")
+                self._readWorkerOutputs(
+                    workDirPath, inputCenterlineCurveNode=inputCenterlineCurveNode,
+                    startRadius=startRadius, stentLength=stentLength,
+                    outputSurfaceModel=outputSurfaceModel, outputCenterlineModel=outputCenterlineModel,
+                    exitDescription=f"ended with code {result}")
+            except Exception as raised:
+                error = raised
+            finished(error)
+
+        def failed(message):
+            if self._cancelRequested:
+                finished(SDFStentCancelledError("Deployment cancelled by user"))
+            else:
+                finished(RuntimeError(str(message)))
+
+        def log(level, message):
+            if processMessageCallback:
+                processMessageCallback(str(message), False)
+
+        self._runningJob = True
+        jobs.run(code,
+                 globals={"argv": [self.workerScriptPath(), workDir]},
+                 files=files,
+                 outputs=[str(workDirPath / name) for name in outputNames],
+                 onDone=done, onFailed=failed, onLog=log,
+                 # svMorph finds the points in contact with a KD-tree, which is SciPy's
+                 packages=["scipy"])
+
+    @staticmethod
+    def workerScriptPath() -> str:
+        """The deployment script that runs outside this process: in a subprocess, or in a worker of the page."""
+        return os.path.join(os.path.dirname(__file__), "Resources", "Scripts", "SDFStent_worker.py")
+
+    @staticmethod
+    def _workerParameters(*, targetRadius, startRadius, stentLength, flareParameters,
+                          flattenedCapHeightFraction, startPointId, verboseLogging, enableSnapshots,
+                          computeOutputModelArrays, saveStep) -> dict:
+        """What the worker is asked to do, as it is written to params.json."""
+        return {
+            "targetRadius": targetRadius,
+            "startRadius": startRadius,
+            "stentLength": stentLength,
+            "flaredEnd": flareParameters["flaredEnd"] if flareParameters else "None",
+            "flareRadius": flareParameters["flareRadius"] if flareParameters else 0.0,
+            "flareLength": flareParameters["flareLength"] if flareParameters else 0.0,
+            "flattenedCapHeightFraction": flattenedCapHeightFraction,
+            "startPointId": startPointId,
+            "verboseLogging": verboseLogging,
+            "enableSnapshots": enableSnapshots,
+            "computeOutputModelArrays": computeOutputModelArrays,
+            "saveStep": saveStep,
+        }
+
+    @staticmethod
+    def _writeWorkerInputs(workDirPath, inputSurfacePolyDataMm, inputCenterlinePolyDataMm, params) -> None:
+        """Write what the worker reads from its working directory: the two meshes and the parameters."""
+        import json
+
+        surfaceWriter = vtk.vtkXMLPolyDataWriter()
+        surfaceWriter.SetFileName(str(workDirPath / "surface_input.vtp"))
+        surfaceWriter.SetInputData(inputSurfacePolyDataMm)
+        surfaceWriter.Write()
+
+        centerlineWriter = vtk.vtkXMLPolyDataWriter()
+        centerlineWriter.SetFileName(str(workDirPath / "centerline_input.vtp"))
+        centerlineWriter.SetInputData(inputCenterlinePolyDataMm)
+        centerlineWriter.Write()
+
+        with open(workDirPath / "params.json", "w") as parametersFile:
+            json.dump(params, parametersFile)
+
+    def _readWorkerOutputs(self, workDirPath, *, inputCenterlineCurveNode, startRadius, stentLength,
+                           outputSurfaceModel, outputCenterlineModel, exitDescription: str) -> None:
+        """Put what the worker left in its working directory into the scene.
+
+        :raises RuntimeError: if the worker reported a failure, or ended without a result at all -
+          which is what a run that died on its input leaves behind.
+        """
+        import json
+
+        resultPath = workDirPath / "result.json"
+        if not resultPath.exists():
+            raise RuntimeError(f"Worker {exitDescription} and produced no result file")
+        with open(resultPath) as resultFile:
+            result = json.load(resultFile)
+        if not result.get("success"):
+            raise RuntimeError(f"Worker failed: {result.get('error', 'unknown error')}")
+        self.getParameterNode().actualRadius = float(result.get("actualRadius", 0.0))
+
+        surfaceReader = vtk.vtkXMLPolyDataReader()
+        surfaceReader.SetFileName(str(workDirPath / "surface_output.vtp"))
+        surfaceReader.Update()
+
+        centerlineReader = vtk.vtkXMLPolyDataReader()
+        centerlineReader.SetFileName(str(workDirPath / "centerline_output.vtp"))
+        centerlineReader.Update()
+
+        self._setDisplayedPolyData(outputSurfaceModel, surfaceReader.GetOutput(), defaultOpacity=0.5, defaultColor=(1.0, 0.5, 0.0))
+        self._setDisplayedPolyData(outputCenterlineModel, centerlineReader.GetOutput())
+
+        stentAxisPath = workDirPath / "stent_axis.json"
+        if stentAxisPath.exists():
+            with open(stentAxisPath) as axisFile:
+                axisPointsCm = json.load(axisFile)
+            self._updateOptionalStentOutputs(self.getParameterNode(), axisPointsCm, inputCenterlineCurveNode,
+                                             float(result.get("actualRadius", 0.0)) * self._mmToCm,
+                                             startRadius, stentLength)
+
     def _useExternalPythonEnv(self) -> bool:
         # jax is not available in on Apple Silicon in x86_64 executables (using Rosetta2 translation).
         # Therefore, for these cases we need to use an external Python environment for the computations.
@@ -1624,42 +1883,20 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         shouldDeleteTemporaryFiles = not preserveTemporaryFiles
         try:
             workDirPath = pathlib.Path(workDir)
-
-            surfaceWriter = vtk.vtkXMLPolyDataWriter()
-            surfaceWriter.SetFileName(str(workDirPath / "surface_input.vtp"))
-            surfaceWriter.SetInputData(inputSurfacePolyDataMm)
-            surfaceWriter.Write()
-
-            centerlineWriter = vtk.vtkXMLPolyDataWriter()
-            centerlineWriter.SetFileName(str(workDirPath / "centerline_input.vtp"))
-            centerlineWriter.SetInputData(inputCenterlinePolyDataMm)
-            centerlineWriter.Write()
-
-            params = {
-                "targetRadius": targetRadius,
-                "startRadius": startRadius,
-                "stentLength": stentLength,
-                "flaredEnd": flareParameters["flaredEnd"] if flareParameters else "None",
-                "flareRadius": flareParameters["flareRadius"] if flareParameters else 0.0,
-                "flareLength": flareParameters["flareLength"] if flareParameters else 0.0,
-                "flattenedCapHeightFraction": flattenedCapHeightFraction,
-                "startPointId": startPointId,
-                "verboseLogging": verboseLogging,
-                "enableSnapshots": enableSnapshots,
-                "computeOutputModelArrays": computeOutputModelArrays,
-                "saveStep": saveStep,
-            }
-            with open(workDirPath / "params.json", "w") as f:
-                json.dump(params, f)
+            params = self._workerParameters(
+                targetRadius=targetRadius, startRadius=startRadius, stentLength=stentLength,
+                flareParameters=flareParameters, flattenedCapHeightFraction=flattenedCapHeightFraction,
+                startPointId=startPointId, verboseLogging=verboseLogging, enableSnapshots=enableSnapshots,
+                computeOutputModelArrays=computeOutputModelArrays, saveStep=saveStep)
+            self._writeWorkerInputs(workDirPath, inputSurfacePolyDataMm, inputCenterlinePolyDataMm, params)
 
             env = slicer.util.startupEnvironment()
             self._ensureExternalDependencies(pythonCmd, env, processMessageCallback)
 
             if processMessageCallback:
                 processMessageCallback("Launching ARM Python worker...", False)
-            workerScript = os.path.join(os.path.dirname(__file__), "Resources", "Scripts", "SDFStent_worker.py")
             proc = subprocess.Popen(
-                pythonCmd + [workerScript, workDir],
+                pythonCmd + [self.workerScriptPath(), workDir],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1682,34 +1919,11 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
             if self._cancelRequested:
                 raise SDFStentCancelledError("Deployment cancelled by user")
 
-            resultPath = workDirPath / "result.json"
-            if resultPath.exists():
-                with open(resultPath) as f:
-                    result = json.load(f)
-                if not result.get("success"):
-                    raise RuntimeError(f"Worker failed: {result.get('error', 'unknown error')}")
-                self.getParameterNode().actualRadius = float(result.get("actualRadius", 0.0))
-            else:
-                raise RuntimeError(f"Worker exited with code {proc.returncode} and produced no result file")
-
-            surfaceReader = vtk.vtkXMLPolyDataReader()
-            surfaceReader.SetFileName(str(workDirPath / "surface_output.vtp"))
-            surfaceReader.Update()
-
-            centerlineReader = vtk.vtkXMLPolyDataReader()
-            centerlineReader.SetFileName(str(workDirPath / "centerline_output.vtp"))
-            centerlineReader.Update()
-
-            self._setDisplayedPolyData(outputSurfaceModel, surfaceReader.GetOutput(), defaultOpacity=0.5, defaultColor=(1.0, 0.5, 0.0))
-            self._setDisplayedPolyData(outputCenterlineModel, centerlineReader.GetOutput())
-
-            stentAxisPath = workDirPath / "stent_axis.json"
-            if stentAxisPath.exists():
-                with open(stentAxisPath) as f:
-                    axisPointsCm = json.load(f)
-                self._updateOptionalStentOutputs(self.getParameterNode(), axisPointsCm, inputCenterlineCurveNode,
-                                                 float(result.get("actualRadius", 0.0)) * self._mmToCm,
-                                                 startRadius, stentLength)
+            self._readWorkerOutputs(
+                workDirPath, inputCenterlineCurveNode=inputCenterlineCurveNode,
+                startRadius=startRadius, stentLength=stentLength,
+                outputSurfaceModel=outputSurfaceModel, outputCenterlineModel=outputCenterlineModel,
+                exitDescription=f"exited with code {proc.returncode}")
             return outputSurfaceModel, outputCenterlineModel
         finally:
             if shouldDeleteTemporaryFiles:
@@ -1723,6 +1937,8 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 class SDFStentTest(ScriptedLoadableModuleTest):
     def setUp(self):
         slicer.mrmlScene.Clear()
+        # Sample data is registered on startupCompleted, which is not emitted if the module is loaded after startup
+        registerSampleData()
 
     def runTest(self):
         self.setUp()
