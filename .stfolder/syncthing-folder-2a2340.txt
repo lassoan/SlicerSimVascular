@@ -1,0 +1,5 @@
+# This directory is a Syncthing folder marker.
+# Do not delete.
+
+folderID: ny3ju-49vfu
+created: 2026-05-15T19:43:41-04:00

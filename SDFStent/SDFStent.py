@@ -1218,7 +1218,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
 
         return int(pointIds[-1])
 
-    def process(self, processMessageCallback=None, onFinished=None) -> tuple[vtkMRMLModelNode, vtkMRMLModelNode]:
+    def process(self, processMessageCallback=None, onFinished=None, background=None) -> tuple[vtkMRMLModelNode, vtkMRMLModelNode]:
         """Run stent deployment. All inputs and parameters are taken from the module's parameter node.
 
         Where the deployment runs in a worker of the page (see runsAsJob) this starts the run and
@@ -1226,6 +1226,10 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         with None, or with the error the run ended in. Everywhere else the run is carried out here,
         so the method returns when it is done and raises what it ran into, and *onFinished* is not
         used.
+
+        *background* overrides where the run is carried out: False deploys here and now, even in a
+        browser, which is what a test does - a test has nothing else to do while it waits, and it
+        cannot wait for a worker, since the answer would arrive through the loop it is blocking.
         """
         parameterNode = self.getParameterNode()
         inputVesselSegmentation = parameterNode.inputVesselSegmentation
@@ -1279,7 +1283,7 @@ class SDFStentLogic(ScriptedLoadableModuleLogic):
         centerPointPositionWorldCm = [c * self._mmToCm for c in centerPointPositionWorld]
         startPointId = self._startPointIdFromCenterAndLength(inputCenterlinePolyDataCm, centerPointPositionWorldCm, stentLengthCm)
 
-        if self.runsAsJob():
+        if self.runsAsJob() if background is None else background:
             # In a browser the deployment runs in a worker of the page (see _processAsJob): it is
             # started here and answered later, so that the views keep drawing while it runs.
             self._processAsJob(
@@ -2081,7 +2085,7 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         self.assertLess(inputRadiusAtCenter, targetRadius)
 
         self.delayDisplay("Deploying stent")
-        outputSurfaceNode, outputCenterlineNode = logic.process()
+        outputSurfaceNode, outputCenterlineNode = logic.process(background=False)
 
         # Output surface and centerline are valid meshes with the same topology as the input
         outputSurfacePolyData = outputSurfaceNode.GetPolyData()
@@ -2209,7 +2213,7 @@ class SDFStentTest(ScriptedLoadableModuleTest):
         parameterNode.outputStentCapsulesModel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "StentCapsules")
 
         self.delayDisplay("Deploying flared stent")
-        outputSurfaceNode, unusedOutputCenterlineNode = logic.process()
+        outputSurfaceNode, unusedOutputCenterlineNode = logic.process(background=False)
         self.assertAlmostEqual(logic.getParameterNode().actualRadius, parameterNode.targetRadius, delta=0.5)
 
         if logic._deploymentState is None:
